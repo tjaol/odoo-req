@@ -453,7 +453,7 @@ fi
 ODOO_CHECK_SCRIPT
 
   # Run it by passing the file content through SSH stdin
-  run_ssh_key bash -c "PASSWORD='$PASSWORD' bash -s" < "$TMP_SCRIPT"
+  run_ssh_key "PASSWORD='$PASSWORD' bash -s" < "$TMP_SCRIPT"
   rm -f "$TMP_SCRIPT"
 
   echo ""
