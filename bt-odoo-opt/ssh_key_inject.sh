@@ -145,7 +145,7 @@ run_ssh_pass() {
     echo "ERROR: sshpass not found. Install: brew install hudochenkov/sshpass/sshpass  OR  apt install sshpass"
     exit 1
   fi
-  sshpass -p "$PASSWORD" ssh "${SSH_BASE_OPTS[@]}" -o PasswordAuthentication=yes "$REMOTE" "$@"
+  sshpass -p "$PASSWORD" ssh "${SSH_BASE_OPTS[@]}" -o PubkeyAuthentication=no -o PasswordAuthentication=yes "$REMOTE" "$@"
 }
 
 run_ssh_key() {
