@@ -247,7 +247,8 @@ do_odoo_check() {
 
   echo ""
   echo "[odoo-check] step 2/3: run Odoo 19 dependency check & install"
-  run_ssh_key bash -s <<'ODOO_CHECK_SCRIPT'
+  # Note: passing PASSWORD to the remote script as an environment variable
+  run_ssh_key bash -c "PASSWORD='$PASSWORD' bash -s" <<'ODOO_CHECK_SCRIPT'
 set -euo pipefail
 
 REQUIREMENTS_URL="https://raw.githubusercontent.com/odoo/odoo/refs/heads/19.0/requirements.txt"
