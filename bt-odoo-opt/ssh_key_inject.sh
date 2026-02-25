@@ -59,6 +59,7 @@ Examples:
     --action auto --run-cmd "bash /tmp/my_script.sh"
 
   # Check and install missing Odoo 19 dependencies
+  # Note: requires root/sudo password (or key) if system packages are missing
   ./ssh_key_inject.sh --host 10.0.0.1 --port 14321 --user adminfpd \
     --password 'pass' --key ~/.ssh/id_ed25519 --action odoo-check
 
@@ -287,22 +288,37 @@ fi
 
 echo ""
 if [ ${#SYS_MISSING[@]} -gt 0 ]; then
-  echo "[WARN] Missing system packages. To fix, please run as ROOT (or use sudo):"
-  echo "  apt-get update"
-  # exclude wkhtmltopdf from apt install string to recommend the deb
+  echo "[WARN] Missing system packages. Attempting to install automatically via sudo..."
+  
   APT_MISSING=()
   for p in "${SYS_MISSING[@]}"; do [ "$p" != "wkhtmltopdf" ] && APT_MISSING+=("$p"); done
+  
   if [ ${#APT_MISSING[@]} -gt 0 ]; then
-    echo "  apt-get install -y ${APT_MISSING[@]}"
+    echo "  Running: sudo apt-get update && sudo apt-get install -y ${APT_MISSING[@]}"
+    if sudo -n true 2>/dev/null; then
+      sudo apt-get update >/dev/null 2>&1
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_MISSING[@]}" || echo "  [!] Failed to install some apt packages."
+    else
+      echo "  [!] Sudo requires a password or user lacks sudo privileges. Please run these manually:"
+      echo "      sudo apt-get update && sudo apt-get install -y ${APT_MISSING[@]}"
+    fi
   fi
+  
   if [[ " ${SYS_MISSING[@]} " =~ " wkhtmltopdf " ]]; then
     echo ""
-    echo "  # For wkhtmltopdf (with patched qt for full PDF features):"
-    echo "  wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
-    echo "  apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+    echo "  [WARN] wkhtmltopdf is missing. Installing patched version from GitHub..."
+    if sudo -n true 2>/dev/null; then
+      cd /tmp
+      wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb || echo "  [!] Failed to install wkhtmltopdf."
+    else
+      echo "  [!] Cannot install wkhtmltopdf automatically without passwordless sudo. Please run:"
+      echo "      wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+      echo "      sudo apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+    fi
   fi
   echo "--------------------------------------------"
-  echo "Proceeding with Python dependency check anyway..."
+  echo "Proceeding with Python dependency check..."
   echo ""
 else
   echo "[OK] All system C dependencies and wkhtmltopdf are installed."
