@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# ssh_key_inject.sh — SSH 公钥注入/撤销 + 远程任务执行框架
-# 用法：
-#   注入：    ./ssh_key_inject.sh --host <ip> --password <pass> --action inject
-#   撤销：    ./ssh_key_inject.sh --host <ip> --password <pass> --action revoke
-#   状态检查：./ssh_key_inject.sh --host <ip> --password <pass> --action status
-#   执行任务：./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action auto --run-cmd "bash /tmp/xxx.sh"
-#   Odoo检测：./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action odoo-check
+# ssh_key_inject.sh - SSH public key injection/revocation + remote task execution framework
+# Usage:
+#   inject:      ./ssh_key_inject.sh --host <ip> --password <pass> --action inject
+#   revoke:      ./ssh_key_inject.sh --host <ip> --password <pass> --action revoke
+#   status:      ./ssh_key_inject.sh --host <ip> --password <pass> --action status
+#   auto:        ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action auto --run-cmd "bash /tmp/xxx.sh"
+#   odoo-check:  ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action odoo-check
 set -euo pipefail
 
-# ── 参数 ──────────────────────────────────────────────────────────────────────
+# ── Parameters ────────────────────────────────────────────────────────────────
 HOST=""
 PORT="22"
 USER="root"
 PASSWORD=""
 KEY=""
 ACTION=""          # inject | revoke | status | auto | odoo-check
-RUN_CMD=""         # 仅 auto 模式
+RUN_CMD=""         # used by auto action only
 SSH_TIMEOUT="10"
 PUBKEY_FILE=""
 PUBKEY=""
@@ -25,44 +25,44 @@ usage() {
 Usage: ssh_key_inject.sh --host <ip> --password <pass> --action <action> [options]
 
 Actions:
-  inject      将公钥追加到远端 authorized_keys（幂等）
-  revoke      从远端 authorized_keys 删除该公钥
-  status      检查公钥是否存在于远端
-  auto        注入 → 执行 --run-cmd → 撤销
-  odoo-check  注入 → 检测并补装 Odoo 19 Python 依赖 → 撤销
+  inject      Append public key to remote authorized_keys (idempotent)
+  revoke      Remove public key from remote authorized_keys
+  status      Check if public key exists on remote host
+  auto        inject -> run --run-cmd -> revoke
+  odoo-check  inject -> detect & install missing Odoo 19 Python deps -> revoke
 
 Options:
   --host <ip>           required
   --port <port>         default 22
   --user <user>         default root
-  --password <pass>     SSH 密码（inject/revoke/status 阶段使用）
-  --key <privkey>       私钥路径（auto/odoo-check 模式执行阶段使用）
-  --pubkey-file <path>  指定公钥文件（默认自动探测 ~/.ssh/id_*.pub）
-  --run-cmd <cmd>       auto 模式中要执行的远程命令
+  --password <pass>     SSH password (used for inject/revoke/status phases)
+  --key <privkey>       Private key path (used for execution phase in auto/odoo-check)
+  --pubkey-file <path>  Public key file (auto-detected from ~/.ssh/id_*.pub if not set)
+  --run-cmd <cmd>       Remote command to run (auto mode only)
   --ssh-timeout <sec>   default 10
   -h|--help
 
 Examples:
-  # 注入公钥
+  # Inject public key
   ./ssh_key_inject.sh --host 10.0.0.1 --password 'pass' --action inject
 
-  # 撤销公钥
+  # Revoke public key
   ./ssh_key_inject.sh --host 10.0.0.1 --password 'pass' --action revoke
 
-  # 检查公钥状态
+  # Check key status
   ./ssh_key_inject.sh --host 10.0.0.1 --password 'pass' --action status
 
-  # 执行自定义命令
+  # Run a custom remote command
   ./ssh_key_inject.sh --host 10.0.0.1 --password 'pass' --key ~/.ssh/id_ed25519 \
     --action auto --run-cmd "bash /tmp/my_script.sh"
 
-  # 检测并补装 Odoo 19 依赖
-  ./ssh_key_inject.sh --host 10.0.0.1 --password 'pass' --key ~/.ssh/id_ed25519 \
-    --action odoo-check
+  # Check and install missing Odoo 19 dependencies
+  ./ssh_key_inject.sh --host 10.0.0.1 --port 14321 --user adminfpd \
+    --password 'pass' --key ~/.ssh/id_ed25519 --action odoo-check
 EOF
 }
 
-# ── 参数解析 ──────────────────────────────────────────────────────────────────
+# ── Argument parsing ───────────────────────────────────────────────────────────
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host)        HOST="${2:-}";        shift 2 ;;
@@ -79,15 +79,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# ── 校验 ──────────────────────────────────────────────────────────────────────
+# ── Validation ────────────────────────────────────────────────────────────────
 [ -n "$HOST" ]   || { echo "--host is required"; exit 1; }
 [ -n "$ACTION" ] || { echo "--action is required"; exit 1; }
 [[ "$ACTION" =~ ^(inject|revoke|status|auto|odoo-check)$ ]] || {
   echo "--action must be inject|revoke|status|auto|odoo-check"; exit 1
 }
 
-# ── 加载公钥 ──────────────────────────────────────────────────────────────────
+# ── Load public key ───────────────────────────────────────────────────────────
 load_pubkey() {
+  # 1. Explicit --pubkey-file
   if [ -n "$PUBKEY_FILE" ]; then
     [ -f "$PUBKEY_FILE" ] || { echo "ERROR: pubkey file not found: $PUBKEY_FILE"; exit 1; }
     PUBKEY="$(cat "$PUBKEY_FILE")"
@@ -95,6 +96,7 @@ load_pubkey() {
     return
   fi
 
+  # 2. Derive .pub from --key path
   if [ -n "$KEY" ]; then
     local pub="${KEY}.pub"
     if [ -f "$pub" ]; then
@@ -104,6 +106,7 @@ load_pubkey() {
     fi
   fi
 
+  # 3. Auto-detect common locations
   for f in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecdsa.pub"; do
     if [ -f "$f" ]; then
       PUBKEY="$(cat "$f")"
@@ -120,7 +123,7 @@ load_pubkey
 
 REMOTE="${USER}@${HOST}"
 
-# ── SSH 工具函数 ───────────────────────────────────────────────────────────────
+# ── SSH helpers ───────────────────────────────────────────────────────────────
 SSH_BASE_OPTS=(
   -p "$PORT"
   -o ConnectTimeout="$SSH_TIMEOUT"
@@ -144,7 +147,7 @@ run_ssh_key() {
 # ── Actions ───────────────────────────────────────────────────────────────────
 
 do_inject() {
-  echo "[inject] → ${REMOTE}:~/.ssh/authorized_keys"
+  echo "[inject] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   local pubkey_escaped
@@ -166,7 +169,7 @@ REMOTE_INJECT
 }
 
 do_revoke() {
-  echo "[revoke] → ${REMOTE}:~/.ssh/authorized_keys"
+  echo "[revoke] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   run_ssh_pass bash -s <<REMOTE_REVOKE
@@ -243,45 +246,56 @@ TMP_REQ="/tmp/odoo19_requirements.txt"
 LOG_FILE="/tmp/odoo19_check_$(date +%Y%m%d_%H%M%S).log"
 
 echo "============================================"
-echo " Odoo 19 Library 检测 & 补装"
+echo " Odoo 19 Dependency Check & Install"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================"
 
-# 探测 Python 环境
+# Detect Python environment (prefer Odoo venv)
+PYTHON=""
 for candidate in \
   /opt/odoo/venv/bin/python3 \
   /opt/odoo/.venv/bin/python3 \
   /home/odoo/venv/bin/python3 \
-  /home/odoo/.venv/bin/python3 \
-  $(which python3 2>/dev/null || true); do
-  if [ -f "$candidate" ] || command -v "$candidate" &>/dev/null 2>&1; then
+  /home/odoo/.venv/bin/python3; do
+  if [ -f "$candidate" ]; then
     PYTHON="$candidate"
     break
   fi
 done
-PYTHON=${PYTHON:-$(which python3)}
+[ -z "$PYTHON" ] && PYTHON="$(which python3)"
 
 PY_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PIP="$(dirname $PYTHON)/pip3"
-[ -f "$PIP" ] || PIP="$PYTHON -m pip"
 
-echo "[env] Python: $PYTHON ($PY_VERSION)"
-echo "[env] Pip:    $PIP"
+# Detect pip - prefer venv pip, fallback to system pip with --break-system-packages
+PIP_CMD=""
+VENV_PIP="$(dirname $PYTHON)/pip3"
+if [ -f "$VENV_PIP" ]; then
+  PIP_CMD="$VENV_PIP"
+  PIP_EXTRA_ARGS=""
+else
+  # System Python on Ubuntu 24.04+ requires --break-system-packages
+  PIP_CMD="$PYTHON -m pip"
+  PIP_EXTRA_ARGS="--break-system-packages"
+fi
+
+echo "[env] Python:   $PYTHON ($PY_VERSION)"
+echo "[env] Pip:      $PIP_CMD $PIP_EXTRA_ARGS"
+echo "[env] Log file: $LOG_FILE (on remote host)"
 echo ""
 
-# 下载 requirements.txt
-echo "[1/3] 下载 Odoo 19 requirements.txt..."
+# Download requirements.txt
+echo "[1/3] Downloading Odoo 19 requirements.txt..."
 if command -v curl &>/dev/null; then
   curl -fsSL "$REQUIREMENTS_URL" -o "$TMP_REQ"
 elif command -v wget &>/dev/null; then
   wget -q "$REQUIREMENTS_URL" -O "$TMP_REQ"
 else
-  echo "ERROR: curl/wget 均不可用"; exit 1
+  echo "ERROR: neither curl nor wget available"; exit 1
 fi
-echo "[1/3] 下载完成"
+echo "[1/3] Download complete ($(wc -l < "$TMP_REQ") lines)"
 echo ""
 
-# 解析包名
+# Parse package names from requirements.txt
 PACKAGES=$($PYTHON -c "
 import re
 pkgs, seen = [], set()
@@ -296,57 +310,72 @@ for line in open('$TMP_REQ'):
 print('\n'.join(pkgs))
 ")
 
-# 检测
-echo "[2/3] 检测安装状态..."
+# Detect installed packages
+echo "[2/3] Checking installation status..."
 MISSING=()
+TOTAL=0
 while IFS= read -r pkg; do
   [ -z "$pkg" ] && continue
+  # Skip Windows-only packages
   [[ "$pkg" == "pypiwin32" ]] && continue
-  if $PIP show "$pkg" &>/dev/null 2>&1; then
-    echo "  ✅ $pkg"
+  TOTAL=$((TOTAL + 1))
+  if $PIP_CMD show "$pkg" &>/dev/null 2>&1; then
+    echo "  [OK] $pkg"
   else
-    echo "  ❌ $pkg (缺失)"
+    echo "  [MISSING] $pkg"
     MISSING+=("$pkg")
   fi
 done <<< "$PACKAGES"
 
+INSTALLED=$((TOTAL - ${#MISSING[@]}))
 echo ""
-echo "已安装: $(($(echo "$PACKAGES" | wc -l) - ${#MISSING[@]}))  缺失: ${#MISSING[@]}"
+echo "Result: $INSTALLED installed, ${#MISSING[@]} missing (total $TOTAL)"
 
 if [ ${#MISSING[@]} -eq 0 ]; then
   echo ""
-  echo "✅ 所有 Odoo 19 依赖已安装，无需补装。"
+  echo "[OK] All Odoo 19 dependencies are installed. Nothing to do."
   exit 0
 fi
 
-# 补装
+# Install missing packages
 echo ""
-echo "[3/3] 补装缺失的包..."
+echo "[3/3] Installing missing packages..."
 FAILED=()
 for pkg in "${MISSING[@]}"; do
-  echo -n "  安装 $pkg ... "
-  if $PIP install "$pkg" >> "$LOG_FILE" 2>&1; then
-    echo "✅"
+  echo -n "  Installing $pkg ... "
+  # Try pip first
+  if $PIP_CMD install $PIP_EXTRA_ARGS "$pkg" >> "$LOG_FILE" 2>&1; then
+    echo "OK"
   else
+    # Fallback: try apt
     apt_pkg="python3-$(echo $pkg | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-    if apt-get install -y "$apt_pkg" >> "$LOG_FILE" 2>&1; then
-      echo "✅ (apt: $apt_pkg)"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y "$apt_pkg" >> "$LOG_FILE" 2>&1; then
+      echo "OK (via apt: $apt_pkg)"
     else
-      echo "❌"
+      echo "FAILED"
       FAILED+=("$pkg")
     fi
   fi
 done
 
 echo ""
+echo "============================================"
 if [ ${#FAILED[@]} -gt 0 ]; then
-  echo "⚠️  以下包安装失败，需手动处理："
+  echo " Install complete with errors"
+  echo "============================================"
+  echo ""
+  echo "[WARN] The following packages failed to install:"
   for pkg in "${FAILED[@]}"; do echo "  - $pkg"; done
-  echo "日志：$LOG_FILE"
+  echo ""
+  echo "Log file on remote host: $LOG_FILE"
+  echo "Retrieve with: scp ${USER}@${HOST}:$LOG_FILE /tmp/"
   exit 1
 else
-  echo "✅ 所有缺失包补装完成！"
-  echo "日志：$LOG_FILE"
+  echo " Install complete - all packages installed successfully"
+  echo "============================================"
+  echo ""
+  echo "[OK] All missing packages have been installed."
+  echo "Log file on remote host: $LOG_FILE"
 fi
 ODOO_CHECK_SCRIPT
 
@@ -354,7 +383,7 @@ ODOO_CHECK_SCRIPT
   echo "[odoo-check] step 3/3: revoke key (via trap)"
 }
 
-# ── 主入口 ────────────────────────────────────────────────────────────────────
+# ── Main entry point ──────────────────────────────────────────────────────────
 case "$ACTION" in
   inject)      do_inject ;;
   revoke)      do_revoke ;;
