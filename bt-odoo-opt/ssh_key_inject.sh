@@ -276,9 +276,9 @@ else
 fi
 
 # 2. Check system C libs required by Python packages (psycopg2, lxml, reportlab, vector graphics, etc.)
-if command -v dpkg &>/dev/null; then
+if command -v dpkg-query &>/dev/null; then
   for sys_pkg in build-essential libpq-dev libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libffi-dev libjpeg-dev zlib1g-dev libfreetype6-dev liblcms2-dev libtiff-dev libopenjp2-7-dev libwebp-dev; do
-    if dpkg -l | grep -q "^ii  $sys_pkg "; then
+    if dpkg-query -W -f='${Status}' "$sys_pkg" 2>/dev/null | grep -q "install ok installed"; then
       echo "  [OK] $sys_pkg"
     else
       echo "  [MISSING] $sys_pkg"
