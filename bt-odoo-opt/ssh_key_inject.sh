@@ -248,9 +248,9 @@ do_odoo_check() {
   echo ""
   echo "[odoo-check] step 2/3: run Odoo 19 dependency check & install"
   # Note: passing PASSWORD to the remote script as an environment variable
-  # Wrap the heredoc in a base64 encoded string to safely pass it along with variables
-  local SCRIPT_B64
-  SCRIPT_B64=$(cat <<'ODOO_CHECK_SCRIPT' | base64
+  # Save script locally and pipe it through ssh to guarantee perfect execution
+  local TMP_SCRIPT="/tmp/odoo_check_payload_$$.sh"
+  cat <<'ODOO_CHECK_SCRIPT' > "$TMP_SCRIPT"
 set -euo pipefail
 
 REQUIREMENTS_URL="https://raw.githubusercontent.com/odoo/odoo/refs/heads/19.0/requirements.txt"
@@ -451,9 +451,10 @@ else
   echo "Log file on remote host: $LOG_FILE"
 fi
 ODOO_CHECK_SCRIPT
-)
 
-  run_ssh_key bash -c "PASSWORD='$PASSWORD' bash -c \"\$(echo '$SCRIPT_B64' | base64 -d)\""
+  # Run it by passing the file content through SSH stdin
+  run_ssh_key bash -c "PASSWORD='$PASSWORD' bash -s" < "$TMP_SCRIPT"
+  rm -f "$TMP_SCRIPT"
 
   echo ""
   echo "[odoo-check] step 3/3: revoke key (via trap)"
