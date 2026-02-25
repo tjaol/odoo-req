@@ -244,13 +244,15 @@ set -euo pipefail
 REQUIREMENTS_URL="https://raw.githubusercontent.com/odoo/odoo/refs/heads/19.0/requirements.txt"
 TMP_REQ="/tmp/odoo19_requirements.txt"
 LOG_FILE="/tmp/odoo19_check_$(date +%Y%m%d_%H%M%S).log"
+VENV_PATH="/opt/odoo/venv"
 
 echo "============================================"
 echo " Odoo 19 Dependency Check & Install"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================"
 
-# Detect Python environment (prefer Odoo venv)
+# Step 0: Ensure a venv exists (no root needed if dir is writable)
+# Priority: existing Odoo venv > create new venv at VENV_PATH
 PYTHON=""
 for candidate in \
   /opt/odoo/venv/bin/python3 \
@@ -259,28 +261,29 @@ for candidate in \
   /home/odoo/.venv/bin/python3; do
   if [ -f "$candidate" ]; then
     PYTHON="$candidate"
+    echo "[env] Found existing venv: $(dirname $(dirname $candidate))"
     break
   fi
 done
-[ -z "$PYTHON" ] && PYTHON="$(which python3)"
 
-PY_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-
-# Detect pip - prefer venv pip, fallback to system pip with --break-system-packages
-PIP_CMD=""
-VENV_PIP="$(dirname $PYTHON)/pip3"
-if [ -f "$VENV_PIP" ]; then
-  PIP_CMD="$VENV_PIP"
-  PIP_EXTRA_ARGS=""
-else
-  # System Python on Ubuntu 24.04+ requires --break-system-packages
-  PIP_CMD="$PYTHON -m pip"
-  PIP_EXTRA_ARGS="--break-system-packages"
+if [ -z "$PYTHON" ]; then
+  echo "[env] No existing Odoo venv found."
+  SYS_PYTHON="$(which python3)"
+  echo "[env] Creating venv at $VENV_PATH using $SYS_PYTHON ..."
+  mkdir -p "$(dirname $VENV_PATH)"
+  $SYS_PYTHON -m venv "$VENV_PATH"
+  PYTHON="$VENV_PATH/bin/python3"
+  echo "[env] Venv created."
 fi
 
+PIP_CMD="$(dirname $PYTHON)/pip3"
+[ -f "$PIP_CMD" ] || PIP_CMD="$PYTHON -m pip"
+PIP_EXTRA_ARGS=""  # venv pip never needs --break-system-packages
+
+PY_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 echo "[env] Python:   $PYTHON ($PY_VERSION)"
-echo "[env] Pip:      $PIP_CMD $PIP_EXTRA_ARGS"
-echo "[env] Log file: $LOG_FILE (on remote host)"
+echo "[env] Pip:      $PIP_CMD"
+echo "[env] Log file: $LOG_FILE (on this remote host)"
 echo ""
 
 # Download requirements.txt
@@ -343,18 +346,11 @@ echo "[3/3] Installing missing packages..."
 FAILED=()
 for pkg in "${MISSING[@]}"; do
   echo -n "  Installing $pkg ... "
-  # Try pip first
   if $PIP_CMD install $PIP_EXTRA_ARGS "$pkg" >> "$LOG_FILE" 2>&1; then
     echo "OK"
   else
-    # Fallback: try apt
-    apt_pkg="python3-$(echo $pkg | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y "$apt_pkg" >> "$LOG_FILE" 2>&1; then
-      echo "OK (via apt: $apt_pkg)"
-    else
-      echo "FAILED"
-      FAILED+=("$pkg")
-    fi
+    echo "FAILED (check log: $LOG_FILE)"
+    FAILED+=("$pkg")
   fi
 done
 
