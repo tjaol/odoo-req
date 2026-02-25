@@ -294,27 +294,24 @@ if [ ${#SYS_MISSING[@]} -gt 0 ]; then
   for p in "${SYS_MISSING[@]}"; do [ "$p" != "wkhtmltopdf" ] && APT_MISSING+=("$p"); done
   
   if [ ${#APT_MISSING[@]} -gt 0 ]; then
-    echo "  Running: sudo apt-get update && sudo apt-get install -y ${APT_MISSING[@]}"
-    if sudo -n true 2>/dev/null; then
-      sudo apt-get update >/dev/null 2>&1
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_MISSING[@]}" || echo "  [!] Failed to install some apt packages."
+    echo "  Running: echo '<password>' | sudo -S apt-get update && sudo -S apt-get install -y ${APT_MISSING[@]}"
+    if echo "$PASSWORD" | sudo -S -n true 2>/dev/null || echo "$PASSWORD" | sudo -S true 2>/dev/null; then
+      echo "$PASSWORD" | sudo -S apt-get update >/dev/null 2>&1
+      echo "$PASSWORD" | sudo -S DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_MISSING[@]}" || echo "  [!] Failed to install some apt packages."
     else
-      echo "  [!] Sudo requires a password or user lacks sudo privileges. Please run these manually:"
-      echo "      sudo apt-get update && sudo apt-get install -y ${APT_MISSING[@]}"
+      echo "  [!] Sudo requires a valid password or user lacks sudo privileges. Please run manually."
     fi
   fi
   
   if [[ " ${SYS_MISSING[@]} " =~ " wkhtmltopdf " ]]; then
     echo ""
     echo "  [WARN] wkhtmltopdf is missing. Installing patched version from GitHub..."
-    if sudo -n true 2>/dev/null; then
+    if echo "$PASSWORD" | sudo -S true 2>/dev/null; then
       cd /tmp
       wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb || echo "  [!] Failed to install wkhtmltopdf."
+      echo "$PASSWORD" | sudo -S DEBIAN_FRONTEND=noninteractive apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb || echo "  [!] Failed to install wkhtmltopdf."
     else
-      echo "  [!] Cannot install wkhtmltopdf automatically without passwordless sudo. Please run:"
-      echo "      wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
-      echo "      sudo apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+      echo "  [!] Cannot install wkhtmltopdf automatically without sudo privileges."
     fi
   fi
   echo "--------------------------------------------"
