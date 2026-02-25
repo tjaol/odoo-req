@@ -6,6 +6,7 @@
 #   status:      ./ssh_key_inject.sh --host <ip> --password <pass> --action status
 #   auto:        ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action auto --run-cmd "bash /tmp/xxx.sh"
 #   odoo-check:  ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action odoo-check
+#   logrotate:   ./ssh_key_inject.sh --action logrotate
 set -euo pipefail
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -14,7 +15,7 @@ PORT="22"
 USER="root"
 PASSWORD=""
 KEY=""
-ACTION=""          # inject | revoke | status | auto | odoo-check
+ACTION=""          # inject | revoke | status | auto | odoo-check | logrotate
 RUN_CMD=""         # used by auto action only
 SSH_TIMEOUT="10"
 PUBKEY_FILE=""
@@ -30,9 +31,10 @@ Actions:
   status      Check if public key exists on remote host
   auto        inject -> run --run-cmd -> revoke
   odoo-check  inject -> detect & install missing Odoo 19 Python deps -> revoke
+  logrotate   Rotate local OpenClaw gateway logs (keeps 5 .gz backups)
 
 Options:
-  --host <ip>           required
+  --host <ip>           required (except for logrotate)
   --port <port>         default 22
   --user <user>         default root
   --password <pass>     SSH password (used for inject/revoke/status phases)
@@ -59,6 +61,9 @@ Examples:
   # Check and install missing Odoo 19 dependencies
   ./ssh_key_inject.sh --host 10.0.0.1 --port 14321 --user adminfpd \
     --password 'pass' --key ~/.ssh/id_ed25519 --action odoo-check
+
+  # Rotate local OpenClaw logs
+  ./ssh_key_inject.sh --action logrotate
 EOF
 }
 
@@ -80,14 +85,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 # ── Validation ────────────────────────────────────────────────────────────────
-[ -n "$HOST" ]   || { echo "--host is required"; exit 1; }
 [ -n "$ACTION" ] || { echo "--action is required"; exit 1; }
-[[ "$ACTION" =~ ^(inject|revoke|status|auto|odoo-check)$ ]] || {
-  echo "--action must be inject|revoke|status|auto|odoo-check"; exit 1
+[[ "$ACTION" =~ ^(inject|revoke|status|auto|odoo-check|logrotate)$ ]] || {
+  echo "--action must be inject|revoke|status|auto|odoo-check|logrotate"; exit 1
 }
+if [ "$ACTION" != "logrotate" ]; then
+  [ -n "$HOST" ] || { echo "--host is required"; exit 1; }
+fi
 
 # ── Load public key ───────────────────────────────────────────────────────────
 load_pubkey() {
+  [ "$ACTION" = "logrotate" ] && return 0
   # 1. Explicit --pubkey-file
   if [ -n "$PUBKEY_FILE" ]; then
     [ -f "$PUBKEY_FILE" ] || { echo "ERROR: pubkey file not found: $PUBKEY_FILE"; exit 1; }
@@ -379,6 +387,37 @@ ODOO_CHECK_SCRIPT
   echo "[odoo-check] step 3/3: revoke key (via trap)"
 }
 
+do_logrotate() {
+  echo "[logrotate] Rotating local OpenClaw gateway logs..."
+  local LOG_DIR="$HOME/.openclaw/logs"
+  local MAX_LOGS=5
+
+  for log_type in "gateway.log" "gateway.err.log"; do
+      local BASE_FILE="$LOG_DIR/$log_type"
+      if [ -s "$BASE_FILE" ]; then
+          echo "  -> Rotating $log_type..."
+          for i in $(seq $((MAX_LOGS - 1)) -1 1); do
+              if [ -f "$BASE_FILE.$i.gz" ]; then
+                  mv "$BASE_FILE.$i.gz" "$BASE_FILE.$((i + 1)).gz"
+              fi
+          done
+          cp "$BASE_FILE" "$BASE_FILE.1"
+          > "$BASE_FILE"
+          gzip -f "$BASE_FILE.1"
+          echo "  -> Done: $log_type"
+      fi
+  done
+
+  find "$LOG_DIR" -name "gateway*.gz" -type f | while read -r file; do
+      local num=$(echo "$file" | grep -o -E '\.[0-9]+\.gz$' | tr -d '.gz')
+      if [ -n "$num" ] && [ "$num" -gt "$MAX_LOGS" ]; then
+          echo "  -> Removing old log: $(basename "$file")"
+          rm "$file"
+      fi
+  done
+  echo "[logrotate] Finished."
+}
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 case "$ACTION" in
   inject)      do_inject ;;
@@ -386,4 +425,5 @@ case "$ACTION" in
   status)      do_status ;;
   auto)        do_auto ;;
   odoo-check)  do_odoo_check ;;
+  logrotate)   do_logrotate ;;
 esac
