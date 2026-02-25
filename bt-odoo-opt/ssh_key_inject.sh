@@ -259,6 +259,59 @@ echo " Odoo 19 Dependency Check & Install"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================"
 
+echo ""
+echo "--- 1. System Dependencies Check (wkhtmltopdf, C libs) ---"
+SYS_MISSING=()
+
+# 1. Check wkhtmltopdf
+if command -v wkhtmltopdf &>/dev/null; then
+  echo "  [OK] wkhtmltopdf ($(wkhtmltopdf --version | head -n1 | grep -o '[0-9.]*' | head -n1 || echo 'unknown'))"
+else
+  echo "  [MISSING] wkhtmltopdf"
+  SYS_MISSING+=("wkhtmltopdf")
+fi
+
+# 2. Check system C libs required by Python packages (psycopg2, lxml, reportlab, vector graphics, etc.)
+if command -v dpkg &>/dev/null; then
+  for sys_pkg in build-essential libpq-dev libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libffi-dev libjpeg-dev zlib1g-dev libfreetype6-dev liblcms2-dev libtiff-dev libopenjp2-7-dev libwebp-dev; do
+    if dpkg -l | grep -q "^ii  $sys_pkg "; then
+      echo "  [OK] $sys_pkg"
+    else
+      echo "  [MISSING] $sys_pkg"
+      SYS_MISSING+=("$sys_pkg")
+    fi
+  done
+else
+  echo "  [SKIP] dpkg not found, skipping apt package checks"
+fi
+
+echo ""
+if [ ${#SYS_MISSING[@]} -gt 0 ]; then
+  echo "[WARN] Missing system packages. To fix, please run as ROOT (or use sudo):"
+  echo "  apt-get update"
+  # exclude wkhtmltopdf from apt install string to recommend the deb
+  APT_MISSING=()
+  for p in "${SYS_MISSING[@]}"; do [ "$p" != "wkhtmltopdf" ] && APT_MISSING+=("$p"); done
+  if [ ${#APT_MISSING[@]} -gt 0 ]; then
+    echo "  apt-get install -y ${APT_MISSING[@]}"
+  fi
+  if [[ " ${SYS_MISSING[@]} " =~ " wkhtmltopdf " ]]; then
+    echo ""
+    echo "  # For wkhtmltopdf (with patched qt for full PDF features):"
+    echo "  wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+    echo "  apt-get install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+  fi
+  echo "--------------------------------------------"
+  echo "Proceeding with Python dependency check anyway..."
+  echo ""
+else
+  echo "[OK] All system C dependencies and wkhtmltopdf are installed."
+  echo "--------------------------------------------"
+  echo ""
+fi
+
+echo "--- 2. Python Environment Check ---"
+
 # Step 0: Ensure a venv exists (no root needed if dir is writable)
 # Priority: existing Odoo venv > create new venv at VENV_PATH
 PYTHON=""
