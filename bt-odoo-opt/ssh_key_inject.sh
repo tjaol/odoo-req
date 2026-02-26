@@ -6,7 +6,9 @@
 #   status:      ./ssh_key_inject.sh --host <ip> --password <pass> --action status
 #   auto:        ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action auto --run-cmd "bash /tmp/xxx.sh"
 #   odoo-check:  ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action odoo-check
-#   logrotate:   ./ssh_key_inject.sh --action logrotate
+#   odoo-setup:  ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action odoo-setup [--rotate-days 30] [--rotate-size 100M] [--rotate-count <n>]
+#   logrotate:        ./ssh_key_inject.sh --action logrotate
+#   remote-logrotate: ./ssh_key_inject.sh --host <ip> --password <pass> --key <privkey> --action remote-logrotate [--rotate-days 30] [--rotate-size 100M] [--rotate-count <n>]
 set -euo pipefail
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -15,11 +17,16 @@ PORT="22"
 USER="root"
 PASSWORD=""
 KEY=""
-ACTION=""          # inject | revoke | status | auto | odoo-check | logrotate
+ACTION=""          # inject | revoke | status | auto | odoo-check | odoo-setup | logrotate | remote-logrotate
 RUN_CMD=""         # used by auto action only
 SSH_TIMEOUT="10"
 PUBKEY_FILE=""
 PUBKEY=""
+ROTATE_DAYS="30"   # remote-logrotate: days to keep
+ROTATE_SIZE=""     # remote-logrotate: max size before rotate (e.g. 100M), empty = no size limit
+ROTATE_COUNT=""    # remote-logrotate: optional file-count cap; empty = unlimited
+AUTH_MODE="auto"   # auto | password | key
+NO_INJECT="0"      # 1 = skip inject/revoke lifecycle (for pre-installed keys)
 
 usage() {
   cat <<'EOF'
@@ -33,15 +40,23 @@ Actions:
   odoo-check  inject -> detect & install missing Odoo 19 Python deps -> revoke
   logrotate   Rotate local OpenClaw gateway logs (keeps 5 .gz backups)
 
+  odoo-setup        inject -> odoo-check (deps) -> remote-logrotate (setup log rotation) -> revoke
+  remote-logrotate  inject -> detect Odoo log path -> setup logrotate on remote -> revoke
+
 Options:
   --host <ip>           required (except for logrotate)
   --port <port>         default 22
   --user <user>         default root
   --password <pass>     SSH password (used for inject/revoke/status phases)
-  --key <privkey>       Private key path (used for execution phase in auto/odoo-check)
+  --key <privkey>       Private key path (used for execution phase in auto/odoo-check/remote-logrotate)
   --pubkey-file <path>  Public key file (auto-detected from ~/.ssh/id_*.pub if not set)
   --run-cmd <cmd>       Remote command to run (auto mode only)
   --ssh-timeout <sec>   default 10
+  --rotate-days <n>     Days to retain logs (default 30)  [remote-logrotate]
+  --rotate-size <s>     Rotate when log exceeds size, e.g. 100M 500M (default: no limit) [remote-logrotate]
+  --rotate-count <n>    Optional max backup files; omit for unlimited [remote-logrotate]
+  --auth-mode <m>       auto|password|key (default: auto)
+  --no-inject           Skip inject/revoke lifecycle (use existing server-side public key)
   -h|--help
 
 Examples:
@@ -63,6 +78,11 @@ Examples:
   ./ssh_key_inject.sh --host 10.0.0.1 --port 14321 --user adminfpd \
     --password 'pass' --key ~/.ssh/id_ed25519 --action odoo-check
 
+  # Rotate remote Odoo logs
+  ./ssh_key_inject.sh --host 10.0.0.1 --port 14321 --user adminfpd \
+    --password 'pass' --key ~/.ssh/id_ed25519 --action remote-logrotate \
+    --rotate-days 30 --rotate-size 100M --rotate-count 14
+
   # Rotate local OpenClaw logs
   ./ssh_key_inject.sh --action logrotate
 EOF
@@ -77,9 +97,14 @@ while [ "$#" -gt 0 ]; do
     --password)    PASSWORD="${2:-}";    shift 2 ;;
     --key)         KEY="${2:-}";         shift 2 ;;
     --pubkey-file) PUBKEY_FILE="${2:-}"; shift 2 ;;
-    --action)      ACTION="${2:-}";      shift 2 ;;
-    --run-cmd)     RUN_CMD="${2:-}";     shift 2 ;;
-    --ssh-timeout) SSH_TIMEOUT="${2:-}"; shift 2 ;;
+    --action)        ACTION="${2:-}";       shift 2 ;;
+    --run-cmd)       RUN_CMD="${2:-}";      shift 2 ;;
+    --ssh-timeout)   SSH_TIMEOUT="${2:-}";  shift 2 ;;
+    --rotate-days)   ROTATE_DAYS="${2:-}";  shift 2 ;;
+    --rotate-size)   ROTATE_SIZE="${2:-}";  shift 2 ;;
+    --rotate-count)  ROTATE_COUNT="${2:-}"; shift 2 ;;
+    --auth-mode)     AUTH_MODE="${2:-}";    shift 2 ;;
+    --no-inject)     NO_INJECT="1";         shift 1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 1 ;;
   esac
@@ -87,18 +112,28 @@ done
 
 # ── Validation ────────────────────────────────────────────────────────────────
 [ -n "$ACTION" ] || { echo "--action is required"; exit 1; }
-[[ "$ACTION" =~ ^(inject|revoke|status|auto|odoo-check|logrotate)$ ]] || {
-  echo "--action must be inject|revoke|status|auto|odoo-check|logrotate"; exit 1
+[[ "$ACTION" =~ ^(inject|revoke|status|auto|odoo-check|odoo-setup|logrotate|remote-logrotate)$ ]] || {
+  echo "--action must be inject|revoke|status|auto|odoo-check|odoo-setup|logrotate|remote-logrotate"; exit 1
 }
 if [ "$ACTION" != "logrotate" ]; then
   [ -n "$HOST" ] || { echo "--host is required"; exit 1; }
+fi
+[[ "$AUTH_MODE" =~ ^(auto|password|key)$ ]] || { echo "--auth-mode must be auto|password|key"; exit 1; }
+if [ "$ACTION" != "logrotate" ] && [ "$AUTH_MODE" = "password" ]; then
+  [ -n "$PASSWORD" ] || { echo "--password is required when --auth-mode password"; exit 1; }
+fi
+if [ "$ACTION" != "logrotate" ] && [ "$AUTH_MODE" = "key" ]; then
+  [ -n "$KEY" ] || { echo "--key is required when --auth-mode key"; exit 1; }
 fi
 
 # ── Load public key ───────────────────────────────────────────────────────────
 load_pubkey() {
   [ "$ACTION" = "logrotate" ] && return 0
+  [ "$NO_INJECT" = "1" ] && return 0
   # 1. Explicit --pubkey-file
   if [ -n "$PUBKEY_FILE" ]; then
+    # Expand tilde if present
+    PUBKEY_FILE="${PUBKEY_FILE/#\~/$HOME}"
     [ -f "$PUBKEY_FILE" ] || { echo "ERROR: pubkey file not found: $PUBKEY_FILE"; exit 1; }
     PUBKEY="$(cat "$PUBKEY_FILE")"
     echo "[key] using pubkey from: $PUBKEY_FILE"
@@ -107,6 +142,8 @@ load_pubkey() {
 
   # 2. Derive .pub from --key path
   if [ -n "$KEY" ]; then
+    # Expand tilde if present
+    KEY="${KEY/#\~/$HOME}"
     local pub="${KEY}.pub"
     if [ -f "$pub" ]; then
       PUBKEY="$(cat "$pub")"
@@ -150,18 +187,37 @@ run_ssh_pass() {
 
 run_ssh_key() {
   [ -n "$KEY" ] || { echo "ERROR: --key required"; exit 1; }
-  ssh "${SSH_BASE_OPTS[@]}" -i "$KEY" -o BatchMode=yes "$REMOTE" "$@"
+  local RESOLVED_KEY="${KEY/#\~/$HOME}"
+  ssh "${SSH_BASE_OPTS[@]}" -i "$RESOLVED_KEY" -o BatchMode=yes "$REMOTE" "$@"
+}
+
+run_ssh_auto() {
+  if [ "$AUTH_MODE" = "password" ]; then
+    run_ssh_pass "$@"
+  elif [ "$AUTH_MODE" = "key" ]; then
+    run_ssh_key "$@"
+  else
+    if [ -n "$KEY" ]; then
+      run_ssh_key "$@" || run_ssh_pass "$@"
+    else
+      run_ssh_pass "$@"
+    fi
+  fi
 }
 
 # ── Actions ───────────────────────────────────────────────────────────────────
 
 do_inject() {
+  if [ "$NO_INJECT" = "1" ]; then
+    echo "[inject] skipped (--no-inject)."
+    return 0
+  fi
   echo "[inject] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   local pubkey_escaped
   pubkey_escaped="$(printf '%s' "$PUBKEY" | sed "s/'/'\\\\''/g")"
-  run_ssh_pass bash -s <<REMOTE_INJECT
+  run_ssh_auto bash -s <<REMOTE_INJECT
 set -e
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
@@ -178,10 +234,14 @@ REMOTE_INJECT
 }
 
 do_revoke() {
+  if [ "$NO_INJECT" = "1" ]; then
+    echo "[revoke] skipped (--no-inject)."
+    return 0
+  fi
   echo "[revoke] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
-  run_ssh_pass bash -s <<REMOTE_REVOKE
+  run_ssh_auto bash -s <<REMOTE_REVOKE
 set -e
 if [ ! -f ~/.ssh/authorized_keys ]; then
   echo "[revoke] authorized_keys not found, nothing to do."
@@ -201,11 +261,16 @@ REMOTE_REVOKE
 }
 
 do_status() {
+  if [ "$NO_INJECT" = "1" ]; then
+    echo "[status] --no-inject enabled: testing connectivity only"
+    run_ssh_auto "echo CONNECTED"
+    return 0
+  fi
   echo "[status] checking ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   local found
-  found="$(run_ssh_pass bash -s <<REMOTE_STATUS
+  found="$(run_ssh_auto bash -s <<REMOTE_STATUS
 if [ -f ~/.ssh/authorized_keys ] && grep -qF '${key_id}' ~/.ssh/authorized_keys 2>/dev/null; then
   echo "PRESENT"
 else
@@ -219,8 +284,9 @@ REMOTE_STATUS
 
 do_auto() {
   [ -n "$RUN_CMD" ] || { echo "ERROR: --run-cmd required for auto action"; exit 1; }
-  [ -n "$KEY" ]     || { echo "ERROR: --key required for auto action"; exit 1; }
-  [ -n "$PASSWORD" ] || { echo "ERROR: --password required for auto action"; exit 1; }
+  if [ "$AUTH_MODE" != "password" ]; then
+    [ -n "$KEY" ] || { echo "ERROR: --key required for auto action in auth-mode $AUTH_MODE"; exit 1; }
+  fi
 
   trap 'echo ""; echo "[auto] cleanup: revoking key..."; do_revoke' EXIT
 
@@ -230,15 +296,16 @@ do_auto() {
   echo ""
   echo "[auto] step 2/3: execute via key auth"
   echo "[auto] cmd: ${RUN_CMD}"
-  run_ssh_key bash -c "$RUN_CMD"
+  run_ssh_auto bash -c "$RUN_CMD"
 
   echo ""
   echo "[auto] step 3/3: revoke key (via trap)"
 }
 
 do_odoo_check() {
-  [ -n "$KEY" ]      || { echo "ERROR: --key required for odoo-check action"; exit 1; }
-  [ -n "$PASSWORD" ] || { echo "ERROR: --password required for odoo-check action"; exit 1; }
+  if [ "$AUTH_MODE" != "password" ]; then
+    [ -n "$KEY" ] || { echo "ERROR: --key required for odoo-check action in auth-mode $AUTH_MODE"; exit 1; }
+  fi
 
   trap 'echo ""; echo "[odoo-check] cleanup: revoking key..."; do_revoke' EXIT
 
@@ -297,18 +364,22 @@ if [ ${#SYS_MISSING[@]} -gt 0 ]; then
   for p in "${SYS_MISSING[@]}"; do [ "$p" != "wkhtmltopdf" ] && APT_MISSING+=("$p"); done
   
   if [ ${#APT_MISSING[@]} -gt 0 ]; then
-    echo "  Running: echo '<password>' | sudo -S apt-get update && sudo -S apt-get install -y ${APT_MISSING[@]}"
+    echo "  Running: echo '<password>' | sudo -S apt-get update && sudo -S apt-get install -y ${APT_MISSING[*]}"
+    # Disable exit on error temporarily
+    set +e
     if echo "$PASSWORD" | sudo -S -n true 2>/dev/null || echo "$PASSWORD" | sudo -S true 2>/dev/null; then
       echo "$PASSWORD" | sudo -S apt-get update >/dev/null 2>&1
       echo "$PASSWORD" | sudo -S DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_MISSING[@]}" || echo "  [!] Failed to install some apt packages."
     else
       echo "  [!] Sudo requires a valid password or user lacks sudo privileges. Please run manually."
     fi
+    set -e
   fi
   
-  if [[ " ${SYS_MISSING[@]} " =~ " wkhtmltopdf " ]]; then
+  if [[ " ${SYS_MISSING[*]} " =~ " wkhtmltopdf " ]]; then
     echo ""
     echo "  [WARN] wkhtmltopdf is missing. Installing patched version from GitHub..."
+    set +e
     if echo "$PASSWORD" | sudo -S true 2>/dev/null; then
       cd /tmp
       wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
@@ -316,6 +387,7 @@ if [ ${#SYS_MISSING[@]} -gt 0 ]; then
     else
       echo "  [!] Cannot install wkhtmltopdf automatically without sudo privileges."
     fi
+    set -e
   fi
   echo "--------------------------------------------"
   echo "Proceeding with Python dependency check..."
@@ -453,11 +525,171 @@ fi
 ODOO_CHECK_SCRIPT
 
   # Run it by passing the file content through SSH stdin
-  run_ssh_key "PASSWORD='$PASSWORD' bash -s" < "$TMP_SCRIPT"
+  run_ssh_auto "PASSWORD='$PASSWORD' bash -s" < "$TMP_SCRIPT"
   rm -f "$TMP_SCRIPT"
 
   echo ""
   echo "[odoo-check] step 3/3: revoke key (via trap)"
+}
+
+do_odoo_setup() {
+  if [ "$AUTH_MODE" != "password" ]; then
+    [ -n "$KEY" ] || { echo "ERROR: --key required for odoo-setup action in auth-mode $AUTH_MODE"; exit 1; }
+  fi
+
+  echo "╔══════════════════════════════════════════════════╗"
+  echo "║           Odoo Full Setup (odoo-setup)           ║"
+  echo "║  1) remote-logrotate — log rotation config      ║"
+  echo "║  2) odoo-check  — deps install                  ║"
+  echo "╚══════════════════════════════════════════════════╝"
+  echo ""
+
+  # ── Phase 1: remote-logrotate ───────────────────────────────
+  echo "━━━ Phase 1/2: Remote log rotation setup ━━━"
+  do_remote_logrotate
+  # do_remote_logrotate sets its own trap for revoke on EXIT
+  # We need to reset the trap before phase 2
+  trap - EXIT
+
+  echo ""
+  echo "━━━ Phase 2/2: Odoo dependency check & install ━━━"
+  do_odoo_check
+  # do_odoo_check has its own trap
+  trap - EXIT
+
+  echo ""
+  echo "╔══════════════════════════════════════════════════╗"
+  echo "║  odoo-setup complete!                            ║"
+  echo "╚══════════════════════════════════════════════════╝"
+}
+
+do_remote_logrotate() {
+  if [ "$AUTH_MODE" != "password" ]; then
+    [ -n "$KEY" ] || { echo "ERROR: --key required for remote-logrotate action in auth-mode $AUTH_MODE"; exit 1; }
+  fi
+
+  trap 'echo ""; echo "[remote-logrotate] cleanup: revoking key..."; do_revoke' EXIT
+
+  echo "[remote-logrotate] step 1/3: inject key"
+  do_inject
+
+  echo ""
+  echo "[remote-logrotate] step 2/3: detect Odoo log path & setup logrotate"
+  echo "  rotate-days:  ${ROTATE_DAYS}"
+  echo "  rotate-size:  ${ROTATE_SIZE:-<no size limit>}"
+  echo "  rotate-count: ${ROTATE_COUNT:-<unlimited>}"
+
+  local TMP_SCRIPT="/tmp/odoo_logrotate_run_$$.sh"
+  cat <<'REMOTE_LOGROTATE' > "$TMP_SCRIPT"
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== [remote-logrotate] Detecting Odoo log path ==="
+
+LOG_PATH=""
+
+# detect logfile from process args (portable, no grep -P)
+LOG_PATH=$(ps aux 2>/dev/null | awk '
+  /[Oo]doo/ && $0 !~ /awk/ {
+    for (i=1; i<=NF; i++) {
+      if ($i == "--logfile" && (i+1)<=NF) { print $(i+1); exit }
+      if ($i ~ /^--logfile=/) { sub(/^--logfile=/, "", $i); print $i; exit }
+    }
+  }
+')
+
+if [ -z "$LOG_PATH" ]; then
+  CONF=$(ps aux 2>/dev/null | awk '
+    /[Oo]doo/ && $0 !~ /awk/ {
+      for (i=1; i<=NF; i++) {
+        if ($i == "-c" && (i+1)<=NF) { print $(i+1); exit }
+        if ($i ~ /^--config=/) { sub(/^--config=/, "", $i); print $i; exit }
+      }
+    }
+  ')
+  if [ -n "$CONF" ] && [ -f "$CONF" ]; then
+    LOG_PATH=$(awk -F= '/^[[:space:]]*logfile[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONF" || true)
+    [ -n "$LOG_PATH" ] && echo "[detect] found via config file ($CONF): $LOG_PATH"
+  fi
+fi
+
+[ -n "$LOG_PATH" ] && echo "[detect] found via process args: $LOG_PATH"
+
+if [ -z "$LOG_PATH" ]; then
+  echo "[detect] process detection failed, scanning common paths..."
+  for candidate in \
+    /var/log/odoo/odoo.log \
+    /var/log/odoo/odoo-server.log \
+    /var/log/odoo-server.log \
+    /var/log/openerp/openerp-server.log \
+    /var/log/odoo19/odoo19-cargo-prd.log \
+    /opt/odoo/logs/odoo.log \
+    /home/odoo/odoo.log; do
+    if [ -f "$candidate" ]; then
+      LOG_PATH="$candidate"
+      echo "[detect] found via common path: $LOG_PATH"
+      break
+    fi
+  done
+fi
+
+if [ -z "$LOG_PATH" ]; then
+  echo "[ERROR] Could not detect Odoo log file path automatically."
+  exit 1
+fi
+
+LOG_DIR=$(dirname "$LOG_PATH")
+LOG_FILE=$(basename "$LOG_PATH")
+LOG_USER=$(stat -c '%U' "$LOG_PATH" 2>/dev/null || echo "odoo")
+LOG_GROUP=$(stat -c '%G' "$LOG_PATH" 2>/dev/null || echo "odoo")
+
+echo ""
+echo "  Log path:  $LOG_PATH"
+echo "  Log owner: $LOG_USER:$LOG_GROUP"
+echo "  Log size:  $(du -sh "$LOG_PATH" 2>/dev/null | cut -f1 || echo 'unknown')"
+
+LOGROTATE_CONF="/etc/logrotate.d/odoo"
+
+{
+  echo "$LOG_PATH {"
+  echo "    daily"
+  [ -n "${ROTATE_COUNT:-}" ] && echo "    rotate ${ROTATE_COUNT}"
+  echo "    maxage ${ROTATE_DAYS}"
+  echo "    compress"
+  echo "    delaycompress"
+  echo "    missingok"
+  echo "    notifempty"
+  echo "    copytruncate"
+  echo "    su ${LOG_USER} ${LOG_GROUP}"
+  [ -n "${ROTATE_SIZE:-}" ] && echo "    size ${ROTATE_SIZE}"
+  echo "    dateext"
+  echo "    dateformat -%Y%m%d-%H%M%S"
+  echo "}"
+} > /tmp/odoo.logrotate.conf
+
+echo ""
+echo "=== [remote-logrotate] Writing /etc/logrotate.d/odoo ==="
+if echo "$PASSWORD" | sudo -S cp /tmp/odoo.logrotate.conf "$LOGROTATE_CONF"; then
+  echo "$PASSWORD" | sudo -S chmod 644 "$LOGROTATE_CONF" >/dev/null 2>&1 || true
+  echo "[OK] config written: $LOGROTATE_CONF"
+  echo "$PASSWORD" | sudo -S logrotate --debug "$LOGROTATE_CONF" 2>&1 | tail -20 || true
+else
+  echo "[WARN] Cannot write $LOGROTATE_CONF (sudo issue)."
+fi
+
+echo ""
+echo "=== [remote-logrotate] Setup complete ==="
+echo "  Config:       $LOGROTATE_CONF"
+echo "  Schedule:     daily, max ${ROTATE_DAYS} days"
+[ -n "${ROTATE_COUNT:-}" ] && echo "  File limit:   ${ROTATE_COUNT}" || echo "  File limit:   unlimited"
+[ -n "${ROTATE_SIZE:-}" ] && echo "  Size trigger: ${ROTATE_SIZE}"
+REMOTE_LOGROTATE
+
+  run_ssh_auto "PASSWORD='$PASSWORD' ROTATE_DAYS='$ROTATE_DAYS' ROTATE_SIZE='$ROTATE_SIZE' ROTATE_COUNT='$ROTATE_COUNT' bash -s" < "$TMP_SCRIPT"
+  rm -f "$TMP_SCRIPT"
+
+  echo ""
+  echo "[remote-logrotate] step 3/3: revoke key (via trap)"
 }
 
 do_logrotate() {
@@ -493,10 +725,12 @@ do_logrotate() {
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 case "$ACTION" in
-  inject)      do_inject ;;
-  revoke)      do_revoke ;;
-  status)      do_status ;;
-  auto)        do_auto ;;
-  odoo-check)  do_odoo_check ;;
-  logrotate)   do_logrotate ;;
+  inject)           do_inject ;;
+  revoke)           do_revoke ;;
+  status)           do_status ;;
+  auto)             do_auto ;;
+  odoo-check)       do_odoo_check ;;
+  odoo-setup)       do_odoo_setup ;;
+  logrotate)        do_logrotate ;;
+  remote-logrotate) do_remote_logrotate ;;
 esac
