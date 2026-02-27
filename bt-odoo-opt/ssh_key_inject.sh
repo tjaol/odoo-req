@@ -321,7 +321,7 @@ do_odoo_check() {
 set -euo pipefail
 
 REQUIREMENTS_URL="https://raw.githubusercontent.com/odoo/odoo/refs/heads/19.0/requirements.txt"
-TMP_REQ="/tmp/odoo19_requirements.txt"
+TMP_REQ="/tmp/odoo19_requirements_$(id -u).txt"
 LOG_FILE="/tmp/odoo19_check_$(date +%Y%m%d_%H%M%S).log"
 VENV_PATH="$HOME/.odoo-venv"
 
