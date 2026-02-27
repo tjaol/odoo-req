@@ -55,9 +55,11 @@ job_url() {
 }
 
 get_crumb() {
-  curl -sg --user "$AUTH" "$JENKINS_URL/crumbIssuer/api/json" 2>/dev/null \
+  # Set globals: CRUMB, COOKIE_JAR
+  COOKIE_JAR="$(mktemp)"
+  CRUMB=$(curl -sgc "$COOKIE_JAR" --user "$AUTH" "$JENKINS_URL/crumbIssuer/api/json" 2>/dev/null \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['crumbRequestField']+':'+d['crumb'])" \
-    2>/dev/null || echo ""
+    2>/dev/null || true)
 }
 
 color_status() {
@@ -125,17 +127,28 @@ cmd_trigger() {
   jurl=$(job_url "$alias")
 
   # CSRF crumb
-  local crumb crumb_header=()
-  crumb=$(get_crumb)
-  [ -n "$crumb" ] && crumb_header=(-H "$crumb")
+  local crumb_header=()
+  local COOKIE_JAR=""
+  local CRUMB=""
+  get_crumb
+  [ -n "$CRUMB" ] && crumb_header=(-H "$CRUMB")
 
   echo "🚀 Triggering: $jname"
 
   local http_code
-  http_code=$(curl -sg -o /dev/null -w "%{http_code}" \
-    --user "$AUTH" \
-    "${crumb_header[@]}" \
-    -X POST "$jurl/build")
+  if [ -n "$COOKIE_JAR" ]; then
+    http_code=$(curl -sg -o /dev/null -w "%{http_code}" \
+      --user "$AUTH" \
+      -b "$COOKIE_JAR" \
+      "${crumb_header[@]}" \
+      -X POST "$jurl/build")
+    rm -f "$COOKIE_JAR"
+  else
+    http_code=$(curl -sg -o /dev/null -w "%{http_code}" \
+      --user "$AUTH" \
+      "${crumb_header[@]}" \
+      -X POST "$jurl/build")
+  fi
 
   if [[ "$http_code" =~ ^(200|201|302)$ ]]; then
     echo "   ✅ Triggered (HTTP $http_code)"
@@ -144,7 +157,10 @@ cmd_trigger() {
     exit 1
   fi
 
-  [ "$wait_flag" = "--wait" ] && wait_for_build "$jurl"
+  if [ "$wait_flag" = "--wait" ]; then
+    wait_for_build "$jurl"
+  fi
+  return 0
 }
 
 # ── cmd: status [alias] ────────────────────────────────────────────────────────
