@@ -109,18 +109,27 @@ wait_for_build() {
 cmd_list() {
   echo "📡 Jenkins: $JENKINS_URL"
   echo ""
-  printf "%-14s %-48s %s\n" "ALIAS" "JOB NAME" "LAST STATUS"
-  printf "%-14s %-48s %s\n" "──────────────" "────────────────────────────────────────────────" "────────────"
+  printf "%-14s %-44s %-12s %s\n" "ALIAS" "JOB NAME" "LAST STATUS" "LAST RUN"
+  printf "%-14s %-44s %-12s %s\n" "──────────────" "────────────────────────────────────────────" "────────────" "─────────────────────"
   for alias in deploy deploy-rolling restart ping; do
-    local jname jurl raw result building num
+    local jname jurl raw result building num ts_str
     jname=$(job_name "$alias")
     jurl=$(job_url "$alias")
-    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number" 2>/dev/null)
+    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,timestamp" 2>/dev/null)
     building=$(echo "$raw" | python3 -c "import json,sys; print(json.load(sys.stdin).get('building',False))" 2>/dev/null || echo "False")
     result=$(echo "$raw"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or 'RUNNING')" 2>/dev/null || echo "?")
     num=$(echo "$raw"      | python3 -c "import json,sys; print(json.load(sys.stdin).get('number','?'))" 2>/dev/null || echo "?")
+    ts_str=$(echo "$raw"   | python3 -c "
+import json,sys,datetime
+d=json.load(sys.stdin)
+ts=d.get('timestamp')
+if ts:
+    print(datetime.datetime.fromtimestamp(ts//1000).strftime('%Y-%m-%d %H:%M'))
+else:
+    print('-')
+" 2>/dev/null || echo "-")
     [ "$building" = "True" ] && result="RUNNING"
-    printf "%-14s %-48s %s\n" "$alias" "$jname" "$(color_status "$result") #$num"
+    printf "%-14s %-44s %-20s %s\n" "$alias" "$jname" "$(color_status "$result") #$num" "$ts_str"
   done
   echo ""
 }
