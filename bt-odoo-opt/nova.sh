@@ -17,16 +17,23 @@
 set -euo pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# Load from .env.jenkins if present (takes precedence over env vars)
+# Credentials MUST be passed as environment variables every time:
+#   JENKINS_USER=xxx JENKINS_PASS=yyy ./nova.sh <command>
+# No defaults — script will exit if not provided.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/.env.jenkins" ]; then
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/.env.jenkins"
-fi
 
 JENKINS_URL="${JENKINS_URL:-https://barron.tg.co.th/jenkins}"
-JENKINS_USER="${JENKINS_USER:-admin}"
-JENKINS_PASS="${JENKINS_PASS:-}"   # No default — must be in .env.jenkins or env var
+
+if [ -z "${JENKINS_USER:-}" ] || [ -z "${JENKINS_PASS:-}" ]; then
+  echo "❌ Error: JENKINS_USER and JENKINS_PASS must be set."
+  echo ""
+  echo "Usage:"
+  echo "  JENKINS_USER=admin JENKINS_PASS=xxx ./nova.sh <command>"
+  echo "  JENKINS_USER=Rut   JENKINS_PASS=yyy ./nova.sh list"
+  exit 1
+fi
+
 AUTH="$JENKINS_USER:$JENKINS_PASS"
 FOLDER="Deploy Code On Nova (Ansible)"
 
