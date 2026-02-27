@@ -109,13 +109,13 @@ wait_for_build() {
 cmd_list() {
   echo "📡 Jenkins: $JENKINS_URL"
   echo ""
-  printf "%-14s %-44s %-12s %s\n" "ALIAS" "JOB NAME" "LAST STATUS" "LAST RUN"
-  printf "%-14s %-44s %-12s %s\n" "──────────────" "────────────────────────────────────────────" "────────────" "─────────────────────"
+  printf "%-14s %-44s %-22s %-18s %s\n" "ALIAS" "JOB NAME" "LAST STATUS" "LAST RUN" "DURATION"
+  printf "%-14s %-44s %-22s %-18s %s\n" "──────────────" "────────────────────────────────────────────" "──────────────────────" "──────────────────" "────────"
   for alias in deploy deploy-rolling restart ping; do
-    local jname jurl raw result building num ts_str
+    local jname jurl raw result building num ts_str dur_str
     jname=$(job_name "$alias")
     jurl=$(job_url "$alias")
-    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,timestamp" 2>/dev/null)
+    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,timestamp,duration" 2>/dev/null)
     building=$(echo "$raw" | python3 -c "import json,sys; print(json.load(sys.stdin).get('building',False))" 2>/dev/null || echo "False")
     result=$(echo "$raw"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or 'RUNNING')" 2>/dev/null || echo "?")
     num=$(echo "$raw"      | python3 -c "import json,sys; print(json.load(sys.stdin).get('number','?'))" 2>/dev/null || echo "?")
@@ -123,13 +123,21 @@ cmd_list() {
 import json,sys,datetime
 d=json.load(sys.stdin)
 ts=d.get('timestamp')
-if ts:
-    print(datetime.datetime.fromtimestamp(ts//1000).strftime('%Y-%m-%d %H:%M'))
+print(datetime.datetime.fromtimestamp(ts//1000).strftime('%Y-%m-%d %H:%M') if ts else '-')
+" 2>/dev/null || echo "-")
+    dur_str=$(echo "$raw"  | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+ms=d.get('duration',0)
+if not ms: print('-')
 else:
-    print('-')
+    s=ms//1000
+    if s<60: print(f'{s}s')
+    elif s<3600: print(f'{s//60}m {s%60}s')
+    else: print(f'{s//3600}h {(s%3600)//60}m')
 " 2>/dev/null || echo "-")
     [ "$building" = "True" ] && result="RUNNING"
-    printf "%-14s %-44s %-20s %s\n" "$alias" "$jname" "$(color_status "$result") #$num" "$ts_str"
+    printf "%-14s %-44s %-22s %-18s %s\n" "$alias" "$jname" "$(color_status "$result") #$num" "$ts_str" "$dur_str"
   done
   echo ""
 }
