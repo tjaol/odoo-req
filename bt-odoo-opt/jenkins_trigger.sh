@@ -10,9 +10,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env.jenkins" ]; then
+  source "$SCRIPT_DIR/.env.jenkins"
+fi
 JENKINS_URL="${JENKINS_URL:-https://barron.tg.co.th/jenkins}"
 JENKINS_USER="${JENKINS_USER:-admin}"
-JENKINS_PASS="${JENKINS_PASS:-tQrGaBERMmA*#03}"
+JENKINS_PASS="${JENKINS_PASS:-}"
 AUTH="$JENKINS_USER:$JENKINS_PASS"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

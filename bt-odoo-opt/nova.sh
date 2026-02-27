@@ -17,9 +17,16 @@
 set -euo pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────────
+# Load from .env.jenkins if present (takes precedence over env vars)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env.jenkins" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env.jenkins"
+fi
+
 JENKINS_URL="${JENKINS_URL:-https://barron.tg.co.th/jenkins}"
 JENKINS_USER="${JENKINS_USER:-admin}"
-JENKINS_PASS="${JENKINS_PASS:-tQrGaBERMmA*#03}"
+JENKINS_PASS="${JENKINS_PASS:-}"   # No default — must be in .env.jenkins or env var
 AUTH="$JENKINS_USER:$JENKINS_PASS"
 FOLDER="Deploy Code On Nova (Ansible)"
 
