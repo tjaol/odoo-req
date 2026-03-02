@@ -16,6 +16,17 @@
 
 set -euo pipefail
 
+# Curl wrapper for insecure toggle (self-signed certs)
+# NOVA_INSECURE=1 to skip TLS verification
+curlx() {
+  if [ "${NOVA_INSECURE:-0}" = "1" ]; then
+    curl -k -sg "$@"
+  else
+    curl -sg "$@"
+  fi
+}
+
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 # Credentials MUST be passed as environment variables every time:
 #   JENKINS_USER=xxx JENKINS_PASS=yyy ./nova.sh <command>
@@ -71,7 +82,7 @@ job_url() {
 get_crumb() {
   # Set globals: CRUMB, COOKIE_JAR
   COOKIE_JAR="$(mktemp)"
-  CRUMB=$(curl -sgc "$COOKIE_JAR" --user "$AUTH" "$JENKINS_URL/crumbIssuer/api/json" 2>/dev/null \
+  CRUMB=$(curlx -gc "$COOKIE_JAR" --user "$AUTH" "$JENKINS_URL/crumbIssuer/api/json" 2>/dev/null \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['crumbRequestField']+':'+d['crumb'])" \
     2>/dev/null || true)
 }
@@ -96,7 +107,7 @@ wait_for_build() {
   while true; do
     attempt=$((attempt + 1))
     local raw
-    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,duration" 2>/dev/null)
+    raw=$(curlx --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,duration" 2>/dev/null)
     local building result num dur
     building=$(echo "$raw" | python3 -c "import json,sys; print(json.load(sys.stdin).get('building',True))")
     result=$(echo "$raw"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or 'RUNNING')")
@@ -122,7 +133,7 @@ cmd_list() {
     local jname jurl raw result building num ts_str dur_str
     jname=$(job_name "$alias")
     jurl=$(job_url "$alias")
-    raw=$(curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,timestamp,duration" 2>/dev/null)
+    raw=$(curlx --user "$AUTH" "$jurl/lastBuild/api/json?tree=result,building,number,timestamp,duration" 2>/dev/null)
     building=$(echo "$raw" | python3 -c "import json,sys; print(json.load(sys.stdin).get('building',False))" 2>/dev/null || echo "False")
     result=$(echo "$raw"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('result') or 'RUNNING')" 2>/dev/null || echo "?")
     num=$(echo "$raw"      | python3 -c "import json,sys; print(json.load(sys.stdin).get('number','?'))" 2>/dev/null || echo "?")
@@ -168,14 +179,14 @@ cmd_trigger() {
 
   local http_code
   if [ -n "$COOKIE_JAR" ]; then
-    http_code=$(curl -sg -o /dev/null -w "%{http_code}" \
+    http_code=$(curl -o /dev/null -w "%{http_code}" \
       --user "$AUTH" \
       -b "$COOKIE_JAR" \
       "${crumb_header[@]}" \
       -X POST "$jurl/build")
     rm -f "$COOKIE_JAR"
   else
-    http_code=$(curl -sg -o /dev/null -w "%{http_code}" \
+    http_code=$(curl -o /dev/null -w "%{http_code}" \
       --user "$AUTH" \
       "${crumb_header[@]}" \
       -X POST "$jurl/build")
@@ -206,7 +217,7 @@ cmd_status() {
   jurl=$(job_url "$alias")
 
   echo "📊 Status: $jname"
-  curl -sg --user "$AUTH" "$jurl/lastBuild/api/json?tree=number,result,building,timestamp,duration,url" \
+  curlx --user "$AUTH" "$jurl/lastBuild/api/json?tree=number,result,building,timestamp,duration,url" \
     | python3 -c "
 import json,sys,datetime
 d = json.load(sys.stdin)
@@ -234,7 +245,7 @@ cmd_log() {
 
   echo "📋 Console log: $jname (last build)"
   echo "──────────────────────────────────────"
-  curl -sg --user "$AUTH" "$jurl/lastBuild/consoleText" | tail -60
+  curlx --user "$AUTH" "$jurl/lastBuild/consoleText" | tail -60
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
