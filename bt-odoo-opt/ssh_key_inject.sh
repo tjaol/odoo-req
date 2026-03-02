@@ -217,7 +217,8 @@ do_inject() {
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   local pubkey_escaped
   pubkey_escaped="$(printf '%s' "$PUBKEY" | sed "s/'/'\\\\''/g")"
-  run_ssh_auto bash -s <<REMOTE_INJECT
+  # inject MUST use password auth — the key isn't on the remote yet
+  run_ssh_pass bash -s <<REMOTE_INJECT
 set -e
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
@@ -241,7 +242,8 @@ do_revoke() {
   echo "[revoke] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
-  run_ssh_auto bash -s <<REMOTE_REVOKE
+  # revoke MUST use password auth — we're removing the key, can't rely on it
+  run_ssh_pass bash -s <<REMOTE_REVOKE
 set -e
 if [ ! -f ~/.ssh/authorized_keys ]; then
   echo "[revoke] authorized_keys not found, nothing to do."
