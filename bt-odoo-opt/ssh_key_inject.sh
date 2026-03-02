@@ -570,6 +570,107 @@ do_remote_logrotate() {
 
   trap 'echo ""; echo "[remote-logrotate] cleanup: revoking key..."; do_revoke' EXIT
 
+  # ── Emergency disk check & cleanup (before inject) ─────────────────────────
+  echo "[remote-logrotate] step 0: checking remote disk space..."
+  local DISK_CHECK_SCRIPT
+  read -r -d '' DISK_CHECK_SCRIPT <<'DISK_CHECK_EOF' || true
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Check disk usage on key partitions
+echo "=== [disk-check] Pre-flight disk space ==="
+df -h / /var /tmp /home 2>/dev/null | sort -u
+
+# Find the partition where authorized_keys lives
+AUTH_DIR="$HOME/.ssh"
+AUTH_PART=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $5}' || echo "?")
+AUTH_AVAIL=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $4}' || echo "?")
+echo ""
+echo "  authorized_keys partition: $AUTH_PART (available: $AUTH_AVAIL)"
+
+# Check if any partition is >= 95% full
+CRITICAL=0
+while IFS= read -r line; do
+  usage=$(echo "$line" | awk '{print $5}' | tr -d '%')
+  mount=$(echo "$line" | awk '{print $6}')
+  [ -z "$usage" ] && continue
+  [[ "$usage" =~ ^[0-9]+$ ]] || continue
+  if [ "$usage" -ge 95 ]; then
+    CRITICAL=1
+    echo ""
+    echo "  [CRITICAL] $mount is ${usage}% full!"
+  fi
+done < <(df -h 2>/dev/null | tail -n +2)
+
+if [ "$CRITICAL" = "1" ]; then
+  echo ""
+  echo "=== [disk-check] Emergency cleanup ==="
+
+  # 1. Clean apt cache
+  if command -v apt-get &>/dev/null; then
+    echo "  [cleanup] apt cache..."
+    echo "$PASSWORD" | sudo -S apt-get clean 2>/dev/null || true
+  fi
+
+  # 2. Clean old journal logs (keep last 2 days)
+  if command -v journalctl &>/dev/null; then
+    echo "  [cleanup] journal logs (keeping 2 days)..."
+    echo "$PASSWORD" | sudo -S journalctl --vacuum-time=2d 2>/dev/null || true
+  fi
+
+  # 3. Truncate Odoo logs that are > 100MB (emergency, not rotate — just cut)
+  echo "  [cleanup] Truncating large Odoo logs (>100MB)..."
+  for log_candidate in \
+    /var/log/odoo/*.log \
+    /var/log/odoo-server.log \
+    /opt/odoo/logs/*.log \
+    /home/odoo/*.log; do
+    [ -f "$log_candidate" ] || continue
+    size_kb=$(du -k "$log_candidate" 2>/dev/null | cut -f1 || echo 0)
+    if [ "$size_kb" -gt 102400 ]; then
+      echo "    Truncating $log_candidate ($(du -sh "$log_candidate" | cut -f1))..."
+      # Keep last 10000 lines, truncate the rest
+      tail -n 10000 "$log_candidate" > "/tmp/odoo_log_tail_$$.tmp" 2>/dev/null || true
+      if [ -s "/tmp/odoo_log_tail_$$.tmp" ]; then
+        cat "/tmp/odoo_log_tail_$$.tmp" > "$log_candidate" 2>/dev/null || \
+          echo "$PASSWORD" | sudo -S tee "$log_candidate" < "/tmp/odoo_log_tail_$$.tmp" >/dev/null 2>&1 || true
+      fi
+      rm -f "/tmp/odoo_log_tail_$$.tmp"
+    fi
+  done
+
+  # 4. Clean /tmp old files (> 7 days)
+  echo "  [cleanup] Old /tmp files (>7 days)..."
+  find /tmp -type f -mtime +7 -delete 2>/dev/null || true
+
+  # 5. Clean old rotated logs
+  echo "  [cleanup] Old rotated logs..."
+  find /var/log -name "*.gz" -mtime +30 -delete 2>/dev/null || true
+  find /var/log -name "*.old" -mtime +30 -delete 2>/dev/null || true
+  find /var/log -name "*.[0-9]" -mtime +30 -delete 2>/dev/null || true
+
+  echo ""
+  echo "=== [disk-check] Post-cleanup disk space ==="
+  df -h / /var /tmp /home 2>/dev/null | sort -u
+
+  # Re-check if we freed enough
+  AUTH_AVAIL_NEW=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
+  echo ""
+  echo "  authorized_keys partition available: $AUTH_AVAIL -> $AUTH_AVAIL_NEW"
+else
+  echo ""
+  echo "  [OK] Disk space is healthy, proceeding."
+fi
+DISK_CHECK_EOF
+
+  # Run the disk check/cleanup BEFORE inject
+  echo "$DISK_CHECK_SCRIPT" > /tmp/disk_check_$$.sh
+  run_ssh_auto "PASSWORD='$PASSWORD' bash -s" < /tmp/disk_check_$$.sh || {
+    echo "[WARN] Disk check failed, attempting inject anyway..."
+  }
+  rm -f /tmp/disk_check_$$.sh
+
+  echo ""
   echo "[remote-logrotate] step 1/3: inject key"
   do_inject
 
