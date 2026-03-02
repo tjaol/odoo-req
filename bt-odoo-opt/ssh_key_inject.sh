@@ -664,10 +664,18 @@ fi
 DISK_CHECK_EOF
 
   # Run the disk check/cleanup BEFORE inject
+  # Note: At this point, key is NOT yet injected on the remote, so we must
+  # explicitly use password auth (sshpass) if password is available.
   echo "$DISK_CHECK_SCRIPT" > /tmp/disk_check_$$.sh
-  run_ssh_auto "PASSWORD='$PASSWORD' bash -s" < /tmp/disk_check_$$.sh || {
-    echo "[WARN] Disk check failed, attempting inject anyway..."
-  }
+  if [ -n "$PASSWORD" ]; then
+    run_ssh_pass "PASSWORD='$PASSWORD' bash -s" < /tmp/disk_check_$$.sh || {
+      echo "[WARN] Disk check failed, attempting inject anyway..."
+    }
+  else
+    run_ssh_auto "PASSWORD='' bash -s" < /tmp/disk_check_$$.sh || {
+      echo "[WARN] Disk check failed, attempting inject anyway..."
+    }
+  fi
   rm -f /tmp/disk_check_$$.sh
 
   echo ""
