@@ -217,7 +217,8 @@ do_inject() {
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
   local pubkey_escaped
   pubkey_escaped="$(printf '%s' "$PUBKEY" | sed "s/'/'\\\\''/g")"
-  run_ssh_auto bash -s <<REMOTE_INJECT
+  # inject MUST use password auth — the key isn't on the remote yet
+  run_ssh_pass bash -s <<REMOTE_INJECT
 set -e
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
@@ -241,7 +242,8 @@ do_revoke() {
   echo "[revoke] -> ${REMOTE}:~/.ssh/authorized_keys"
   local key_id
   key_id="$(printf '%s' "$PUBKEY" | awk '{print $NF}')"
-  run_ssh_auto bash -s <<REMOTE_REVOKE
+  # revoke MUST use password auth — we're removing the key, can't rely on it
+  run_ssh_pass bash -s <<REMOTE_REVOKE
 set -e
 if [ ! -f ~/.ssh/authorized_keys ]; then
   echo "[revoke] authorized_keys not found, nothing to do."
@@ -570,6 +572,115 @@ do_remote_logrotate() {
 
   trap 'echo ""; echo "[remote-logrotate] cleanup: revoking key..."; do_revoke' EXIT
 
+  # ── Emergency disk check & cleanup (before inject) ─────────────────────────
+  echo "[remote-logrotate] step 0: checking remote disk space..."
+  local DISK_CHECK_SCRIPT
+  read -r -d '' DISK_CHECK_SCRIPT <<'DISK_CHECK_EOF' || true
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Check disk usage on key partitions
+echo "=== [disk-check] Pre-flight disk space ==="
+df -h / /var /tmp /home 2>/dev/null | sort -u
+
+# Find the partition where authorized_keys lives
+AUTH_DIR="$HOME/.ssh"
+AUTH_PART=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $5}' || echo "?")
+AUTH_AVAIL=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $4}' || echo "?")
+echo ""
+echo "  authorized_keys partition: $AUTH_PART (available: $AUTH_AVAIL)"
+
+# Check if any partition is >= 95% full
+CRITICAL=0
+while IFS= read -r line; do
+  usage=$(echo "$line" | awk '{print $5}' | tr -d '%')
+  mount=$(echo "$line" | awk '{print $6}')
+  [ -z "$usage" ] && continue
+  [[ "$usage" =~ ^[0-9]+$ ]] || continue
+  if [ "$usage" -ge 95 ]; then
+    CRITICAL=1
+    echo ""
+    echo "  [CRITICAL] $mount is ${usage}% full!"
+  fi
+done < <(df -h 2>/dev/null | tail -n +2)
+
+if [ "$CRITICAL" = "1" ]; then
+  echo ""
+  echo "=== [disk-check] Emergency cleanup ==="
+
+  # 1. Clean apt cache
+  if command -v apt-get &>/dev/null; then
+    echo "  [cleanup] apt cache..."
+    echo "$PASSWORD" | sudo -S apt-get clean 2>/dev/null || true
+  fi
+
+  # 2. Clean old journal logs (keep last 2 days)
+  if command -v journalctl &>/dev/null; then
+    echo "  [cleanup] journal logs (keeping 2 days)..."
+    echo "$PASSWORD" | sudo -S journalctl --vacuum-time=2d 2>/dev/null || true
+  fi
+
+  # 3. Truncate Odoo logs that are > 100MB (emergency, not rotate — just cut)
+  echo "  [cleanup] Truncating large Odoo logs (>100MB)..."
+  for log_candidate in \
+    /var/log/odoo/*.log \
+    /var/log/odoo-server.log \
+    /opt/odoo/logs/*.log \
+    /home/odoo/*.log; do
+    [ -f "$log_candidate" ] || continue
+    size_kb=$(du -k "$log_candidate" 2>/dev/null | cut -f1 || echo 0)
+    if [ "$size_kb" -gt 102400 ]; then
+      echo "    Truncating $log_candidate ($(du -sh "$log_candidate" | cut -f1))..."
+      # Keep last 10000 lines, truncate the rest
+      tail -n 10000 "$log_candidate" > "/tmp/odoo_log_tail_$$.tmp" 2>/dev/null || true
+      if [ -s "/tmp/odoo_log_tail_$$.tmp" ]; then
+        cat "/tmp/odoo_log_tail_$$.tmp" > "$log_candidate" 2>/dev/null || \
+          echo "$PASSWORD" | sudo -S tee "$log_candidate" < "/tmp/odoo_log_tail_$$.tmp" >/dev/null 2>&1 || true
+      fi
+      rm -f "/tmp/odoo_log_tail_$$.tmp"
+    fi
+  done
+
+  # 4. Clean /tmp old files (> 7 days)
+  echo "  [cleanup] Old /tmp files (>7 days)..."
+  find /tmp -type f -mtime +7 -delete 2>/dev/null || true
+
+  # 5. Clean old rotated logs
+  echo "  [cleanup] Old rotated logs..."
+  find /var/log -name "*.gz" -mtime +30 -delete 2>/dev/null || true
+  find /var/log -name "*.old" -mtime +30 -delete 2>/dev/null || true
+  find /var/log -name "*.[0-9]" -mtime +30 -delete 2>/dev/null || true
+
+  echo ""
+  echo "=== [disk-check] Post-cleanup disk space ==="
+  df -h / /var /tmp /home 2>/dev/null | sort -u
+
+  # Re-check if we freed enough
+  AUTH_AVAIL_NEW=$(df "$AUTH_DIR" 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
+  echo ""
+  echo "  authorized_keys partition available: $AUTH_AVAIL -> $AUTH_AVAIL_NEW"
+else
+  echo ""
+  echo "  [OK] Disk space is healthy, proceeding."
+fi
+DISK_CHECK_EOF
+
+  # Run the disk check/cleanup BEFORE inject
+  # Note: At this point, key is NOT yet injected on the remote, so we must
+  # explicitly use password auth (sshpass) if password is available.
+  echo "$DISK_CHECK_SCRIPT" > /tmp/disk_check_$$.sh
+  if [ -n "$PASSWORD" ]; then
+    run_ssh_pass "PASSWORD='$PASSWORD' bash -s" < /tmp/disk_check_$$.sh || {
+      echo "[WARN] Disk check failed, attempting inject anyway..."
+    }
+  else
+    run_ssh_auto "PASSWORD='' bash -s" < /tmp/disk_check_$$.sh || {
+      echo "[WARN] Disk check failed, attempting inject anyway..."
+    }
+  fi
+  rm -f /tmp/disk_check_$$.sh
+
+  echo ""
   echo "[remote-logrotate] step 1/3: inject key"
   do_inject
 
@@ -584,39 +695,114 @@ do_remote_logrotate() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== [remote-logrotate] Detecting Odoo log path ==="
+echo "=== [remote-logrotate] Detecting ALL Odoo instances ==="
 
-LOG_PATH=""
+# ── Collect all Odoo log paths (multi-instance aware) ────────────────────────
+declare -A LOG_PATHS  # associative array: service_name -> log_path
 
-# detect logfile from process args (portable, no grep -P)
-LOG_PATH=$(ps aux 2>/dev/null | awk '
+# ── Method 1: systemctl (most reliable for multi-instance) ───────────────────
+if command -v systemctl &>/dev/null; then
+  echo "[detect] Scanning systemd units for Odoo services..."
+  while IFS= read -r unit; do
+    [ -z "$unit" ] && continue
+    svc_name="${unit%.service}"
+    echo "  [systemd] Found service: $svc_name"
+
+    # Try to get config path from ExecStart
+    EXEC_LINE=$(systemctl show "$unit" --property=ExecStart 2>/dev/null | head -1 || true)
+    CONF_PATH=""
+
+    # Extract -c or --config= from ExecStart
+    if echo "$EXEC_LINE" | grep -qE '(-c|--config[= ])'; then
+      CONF_PATH=$(echo "$EXEC_LINE" | grep -oE '(-c |--config[= ])[^ ;]+' | head -1 | sed 's/^-c //;s/^--config[= ]*//')
+    fi
+
+    # Also check drop-in or environment files for config path
+    if [ -z "$CONF_PATH" ]; then
+      ENV_FILE=$(systemctl show "$unit" --property=EnvironmentFile 2>/dev/null | sed 's/^EnvironmentFile=//' | tr -d ' ' || true)
+      if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+        CONF_PATH=$(grep -oP '(?<=ODOO_CONFIG=|CONFIG_FILE=).*' "$ENV_FILE" 2>/dev/null | head -1 || true)
+      fi
+    fi
+
+    # Try to read logfile from the config
+    LOG_PATH=""
+    if [ -n "$CONF_PATH" ] && [ -f "$CONF_PATH" ]; then
+      LOG_PATH=$(awk -F= '/^[[:space:]]*logfile[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' "$CONF_PATH" 2>/dev/null | head -1 || true)
+      [ -n "$LOG_PATH" ] && echo "    [config] $CONF_PATH -> logfile: $LOG_PATH"
+    fi
+
+    # Fallback: check ExecStart for --logfile
+    if [ -z "$LOG_PATH" ]; then
+      LOG_PATH=$(echo "$EXEC_LINE" | grep -oE '(--logfile[= ])[^ ;]+' | head -1 | sed 's/^--logfile[= ]*//' || true)
+      [ -n "$LOG_PATH" ] && echo "    [execstart] logfile: $LOG_PATH"
+    fi
+
+    if [ -n "$LOG_PATH" ] && [ -f "$LOG_PATH" ]; then
+      LOG_PATHS["$svc_name"]="$LOG_PATH"
+    else
+      echo "    [WARN] Could not find log file for $svc_name (config: ${CONF_PATH:-none}, log: ${LOG_PATH:-none})"
+    fi
+  done < <(systemctl list-units --type=service --all --plain --no-legend 2>/dev/null | awk '/[Oo]doo/{print $1}')
+fi
+
+# ── Method 2: process scan (catch non-systemd or Docker instances) ───────────
+echo ""
+echo "[detect] Scanning running processes for Odoo instances..."
+while IFS= read -r log_path; do
+  [ -z "$log_path" ] && continue
+  if [ -f "$log_path" ]; then
+    # Use the log path as a pseudo service name if not already found
+    base_name=$(basename "$log_path" .log)
+    key="proc-${base_name}"
+    # Don't overwrite systemd-discovered entries
+    already_found=0
+    for existing in "${LOG_PATHS[@]:-}"; do
+      [ "$existing" = "$log_path" ] && already_found=1 && break
+    done
+    if [ "$already_found" = "0" ]; then
+      LOG_PATHS["$key"]="$log_path"
+      echo "  [process] Found: $log_path"
+    fi
+  fi
+done < <(ps aux 2>/dev/null | awk '
   /[Oo]doo/ && $0 !~ /awk/ {
     for (i=1; i<=NF; i++) {
-      if ($i == "--logfile" && (i+1)<=NF) { print $(i+1); exit }
-      if ($i ~ /^--logfile=/) { sub(/^--logfile=/, "", $i); print $i; exit }
+      if ($i == "--logfile" && (i+1)<=NF) { print $(i+1) }
+      if ($i ~ /^--logfile=/) { sub(/^--logfile=/, "", $i); print $i }
     }
   }
 ')
 
-if [ -z "$LOG_PATH" ]; then
-  CONF=$(ps aux 2>/dev/null | awk '
-    /[Oo]doo/ && $0 !~ /awk/ {
-      for (i=1; i<=NF; i++) {
-        if ($i == "-c" && (i+1)<=NF) { print $(i+1); exit }
-        if ($i ~ /^--config=/) { sub(/^--config=/, "", $i); print $i; exit }
-      }
-    }
-  ')
-  if [ -n "$CONF" ] && [ -f "$CONF" ]; then
-    LOG_PATH=$(awk -F= '/^[[:space:]]*logfile[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONF" || true)
-    [ -n "$LOG_PATH" ] && echo "[detect] found via config file ($CONF): $LOG_PATH"
+# Also scan config files found in process args
+while IFS= read -r conf_path; do
+  [ -z "$conf_path" ] && continue
+  [ ! -f "$conf_path" ] && continue
+  log_path=$(awk -F= '/^[[:space:]]*logfile[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' "$conf_path" 2>/dev/null | head -1 || true)
+  if [ -n "$log_path" ] && [ -f "$log_path" ]; then
+    already_found=0
+    for existing in "${LOG_PATHS[@]:-}"; do
+      [ "$existing" = "$log_path" ] && already_found=1 && break
+    done
+    if [ "$already_found" = "0" ]; then
+      base_name=$(basename "$log_path" .log)
+      LOG_PATHS["proc-${base_name}"]="$log_path"
+      echo "  [config] $conf_path -> $log_path"
+    fi
   fi
-fi
+done < <(ps aux 2>/dev/null | awk '
+  /[Oo]doo/ && $0 !~ /awk/ {
+    for (i=1; i<=NF; i++) {
+      if ($i == "-c" && (i+1)<=NF) { print $(i+1) }
+      if ($i ~ /^--config=/) { sub(/^--config=/, "", $i); print $i }
+    }
+  }
+')
 
-[ -n "$LOG_PATH" ] && echo "[detect] found via process args: $LOG_PATH"
-
-if [ -z "$LOG_PATH" ]; then
-  echo "[detect] process detection failed, scanning common paths..."
+# ── Method 3: common path fallback (if nothing found yet) ────────────────────
+if [ ${#LOG_PATHS[@]} -eq 0 ]; then
+  echo ""
+  echo "[detect] No instances found via systemd/process, scanning common paths..."
   for candidate in \
     /var/log/odoo/odoo.log \
     /var/log/odoo/odoo-server.log \
@@ -626,53 +812,76 @@ if [ -z "$LOG_PATH" ]; then
     /opt/odoo/logs/odoo.log \
     /home/odoo/odoo.log; do
     if [ -f "$candidate" ]; then
-      LOG_PATH="$candidate"
-      echo "[detect] found via common path: $LOG_PATH"
-      break
+      base_name=$(basename "$candidate" .log)
+      LOG_PATHS["fallback-${base_name}"]="$candidate"
+      echo "  [fallback] Found: $candidate"
     fi
   done
 fi
 
-if [ -z "$LOG_PATH" ]; then
-  echo "[ERROR] Could not detect Odoo log file path automatically."
+# ── Result summary ───────────────────────────────────────────────────────────
+echo ""
+echo "============================================"
+echo " Discovered ${#LOG_PATHS[@]} Odoo log file(s)"
+echo "============================================"
+
+if [ ${#LOG_PATHS[@]} -eq 0 ]; then
+  echo "[ERROR] Could not detect any Odoo log file paths automatically."
   exit 1
 fi
 
-LOG_DIR=$(dirname "$LOG_PATH")
-LOG_FILE=$(basename "$LOG_PATH")
-LOG_USER=$(stat -c '%U' "$LOG_PATH" 2>/dev/null || echo "odoo")
-LOG_GROUP=$(stat -c '%G' "$LOG_PATH" 2>/dev/null || echo "odoo")
+for svc in "${!LOG_PATHS[@]}"; do
+  lp="${LOG_PATHS[$svc]}"
+  sz=$(du -sh "$lp" 2>/dev/null | cut -f1 || echo "?")
+  own=$(stat -c '%U:%G' "$lp" 2>/dev/null || echo "?:?")
+  echo "  [$svc] $lp  (size: $sz, owner: $own)"
+done
 
-echo ""
-echo "  Log path:  $LOG_PATH"
-echo "  Log owner: $LOG_USER:$LOG_GROUP"
-echo "  Log size:  $(du -sh "$LOG_PATH" 2>/dev/null | cut -f1 || echo 'unknown')"
-
+# ── Generate logrotate config for ALL discovered instances ───────────────────
 LOGROTATE_CONF="/etc/logrotate.d/odoo"
 
 {
-  echo "$LOG_PATH {"
-  echo "    daily"
-  [ -n "${ROTATE_COUNT:-}" ] && echo "    rotate ${ROTATE_COUNT}"
-  echo "    maxage ${ROTATE_DAYS}"
-  echo "    compress"
-  echo "    delaycompress"
-  echo "    missingok"
-  echo "    notifempty"
-  echo "    copytruncate"
-  echo "    su ${LOG_USER} ${LOG_GROUP}"
-  [ -n "${ROTATE_SIZE:-}" ] && echo "    size ${ROTATE_SIZE}"
-  echo "    dateext"
-  echo "    dateformat -%Y%m%d-%H%M%S"
-  echo "}"
-} > /tmp/odoo.logrotate.conf
+  echo "# Auto-generated by ssh_key_inject.sh (multi-instance)"
+  echo "# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "# Instances: ${#LOG_PATHS[@]}"
+  echo ""
+
+  for svc in "${!LOG_PATHS[@]}"; do
+    lp="${LOG_PATHS[$svc]}"
+    LOG_USER=$(stat -c '%U' "$lp" 2>/dev/null || echo "odoo")
+    LOG_GROUP=$(stat -c '%G' "$lp" 2>/dev/null || echo "odoo")
+
+    echo "# Instance: $svc"
+    echo "$lp {"
+    echo "    daily"
+    [ -n "${ROTATE_COUNT:-}" ] && echo "    rotate ${ROTATE_COUNT}"
+    echo "    maxage ${ROTATE_DAYS}"
+    echo "    compress"
+    echo "    delaycompress"
+    echo "    missingok"
+    echo "    notifempty"
+    echo "    copytruncate"
+    echo "    su ${LOG_USER} ${LOG_GROUP}"
+    [ -n "${ROTATE_SIZE:-}" ] && echo "    size ${ROTATE_SIZE}"
+    echo "    dateext"
+    echo "    dateformat -%Y%m%d-%H%M%S"
+    echo "}"
+    echo ""
+  done
+} | echo "$PASSWORD" | sudo -S tee /tmp/odoo.logrotate.conf >/dev/null
 
 echo ""
-echo "=== [remote-logrotate] Writing /etc/logrotate.d/odoo ==="
+echo "=== [remote-logrotate] Writing $LOGROTATE_CONF ==="
+echo "    (covering ${#LOG_PATHS[@]} instance(s))"
 if echo "$PASSWORD" | sudo -S cp /tmp/odoo.logrotate.conf "$LOGROTATE_CONF"; then
   echo "$PASSWORD" | sudo -S chmod 644 "$LOGROTATE_CONF" >/dev/null 2>&1 || true
   echo "[OK] config written: $LOGROTATE_CONF"
-  echo "$PASSWORD" | sudo -S logrotate --debug "$LOGROTATE_CONF" 2>&1 | tail -20 || true
+  echo ""
+  echo "--- Config content ---"
+  cat "$LOGROTATE_CONF"
+  echo "--- End config ---"
+  echo ""
+  echo "$PASSWORD" | sudo -S logrotate --debug "$LOGROTATE_CONF" 2>&1 | tail -30 || true
 else
   echo "[WARN] Cannot write $LOGROTATE_CONF (sudo issue)."
 fi
@@ -680,9 +889,13 @@ fi
 echo ""
 echo "=== [remote-logrotate] Setup complete ==="
 echo "  Config:       $LOGROTATE_CONF"
+echo "  Instances:    ${#LOG_PATHS[@]}"
 echo "  Schedule:     daily, max ${ROTATE_DAYS} days"
 [ -n "${ROTATE_COUNT:-}" ] && echo "  File limit:   ${ROTATE_COUNT}" || echo "  File limit:   unlimited"
 [ -n "${ROTATE_SIZE:-}" ] && echo "  Size trigger: ${ROTATE_SIZE}"
+for svc in "${!LOG_PATHS[@]}"; do
+  echo "  [$svc] ${LOG_PATHS[$svc]}"
+done
 REMOTE_LOGROTATE
 
   run_ssh_auto "PASSWORD='$PASSWORD' ROTATE_DAYS='$ROTATE_DAYS' ROTATE_SIZE='$ROTATE_SIZE' ROTATE_COUNT='$ROTATE_COUNT' bash -s" < "$TMP_SCRIPT"
