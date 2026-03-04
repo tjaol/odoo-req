@@ -4,7 +4,14 @@ set -uo pipefail  # no -e, use explicit error handling
 # ===== config =====
 MOUNT="/"
 THRESHOLD=85
-KEEP_DAYS=7
+
+# Emergency journald policy
+JOURNAL_KEEP_DAYS=14
+JOURNAL_MAX_SIZE="500M"
+
+# Rotation/archive policy
+ARCHIVE_SOURCE_MIN_DAYS=7   # archive rotated logs older than this
+ARCHIVE_RETENTION_DAYS=30   # delete archives older than this
 
 ODOO_LOG_DIR="/var/log/odoo19"
 ARCHIVE_BASE="/data/log-archive"
@@ -23,8 +30,8 @@ used="$(disk_used_pct)"
 if [ "$used" -ge "$THRESHOLD" ]; then
   echo "$(ts) [EMERG] disk ${MOUNT} used=${used}% -> truncating" >&2
 
-  journalctl --vacuum-time="${KEEP_DAYS}d" >/dev/null 2>&1 || true
-  journalctl --vacuum-size=500M            >/dev/null 2>&1 || true
+  journalctl --vacuum-time="${JOURNAL_KEEP_DAYS}d" >/dev/null 2>&1 || true
+  journalctl --vacuum-size="$JOURNAL_MAX_SIZE"      >/dev/null 2>&1 || true
 
   for f in /var/log/syslog /var/log/auth.log /var/log/kern.log; do
     [ -f "$f" ] && truncate -s 0 "$f" || true
@@ -42,7 +49,7 @@ if [ "$used" -ge "$THRESHOLD" ]; then
 fi
 
 # ===== 2) archive rotated logs =====
-find "$ODOO_LOG_DIR" -maxdepth 1 -type f -name 'odoo19-*.log-*' -mtime +1 -print0 2>/dev/null \
+find "$ODOO_LOG_DIR" -maxdepth 1 -type f -name 'odoo19-*.log-*' -mtime +"$ARCHIVE_SOURCE_MIN_DAYS" -print0 2>/dev/null \
 | while IFS= read -r -d '' f; do
     base="$(basename "$f")"
     if [ ! -f "$ARCHIVE_ODOO/${base}.tar.gz" ]; then
@@ -51,7 +58,7 @@ find "$ODOO_LOG_DIR" -maxdepth 1 -type f -name 'odoo19-*.log-*' -mtime +1 -print
     fi
   done || true
 
-find /var/log -maxdepth 1 -type f \( -name 'syslog.*' -o -name 'auth.log.*' -o -name 'kern.log.*' \) -mtime +1 -print0 2>/dev/null \
+find /var/log -maxdepth 1 -type f \( -name 'syslog.*' -o -name 'auth.log.*' -o -name 'kern.log.*' \) -mtime +"$ARCHIVE_SOURCE_MIN_DAYS" -print0 2>/dev/null \
 | while IFS= read -r -d '' f; do
     base="$(basename "$f")"
     if [ ! -f "$ARCHIVE_SYS/${base}.tar.gz" ]; then
@@ -61,6 +68,6 @@ find /var/log -maxdepth 1 -type f \( -name 'syslog.*' -o -name 'auth.log.*' -o -
   done || true
 
 # ===== 3) retention =====
-find "$ARCHIVE_BASE" -type f -name '*.tar.gz' -mtime +"$KEEP_DAYS" -delete 2>/dev/null || true
+find "$ARCHIVE_BASE" -type f -name '*.tar.gz' -mtime +"$ARCHIVE_RETENTION_DAYS" -delete 2>/dev/null || true
 
 echo "$(ts) [OK] log policy done. disk_used=$(disk_used_pct)%"
