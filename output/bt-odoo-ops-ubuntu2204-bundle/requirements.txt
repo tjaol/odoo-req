@@ -1,0 +1,19 @@
+# nova.sh Python/pip requirements
+# Note: nova.sh only uses Python standard library (json, urllib.parse, datetime)
+# No third-party Python packages are required.
+
+# You can safely run:
+#   pip install -r requirements.txt
+# It will not install anything.
+
+# System dependencies (install manually, not via pip):
+# - curl
+# - python3
+# - coreutils: mktemp, grep, tail, sleep (usually built-in)
+
+# Ubuntu/Debian:
+#   sudo apt update && sudo apt install -y curl python3
+# CentOS/RHEL:
+#   sudo yum install -y curl python3
+# macOS (Homebrew):
+#   brew install curl python
