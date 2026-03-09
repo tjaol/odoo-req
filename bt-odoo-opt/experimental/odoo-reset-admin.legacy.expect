@@ -1,0 +1,64 @@
+#!/usr/bin/expect -f
+set timeout 300
+if {$argc != 5} {
+  puts stderr "Usage: odoo-reset-admin.expect <ssh_user> <ssh_host> <ssh_port> <remote_tmp> <local_script_path>"
+  exit 2
+}
+
+set ssh_user [lindex $argv 0]
+set ssh_host [lindex $argv 1]
+set ssh_port [lindex $argv 2]
+set remote_tmp [lindex $argv 3]
+set local_script_path [lindex $argv 4]
+
+if {![info exists env(ODOO_SUDO_PASS)] || $env(ODOO_SUDO_PASS) eq ""} {
+  puts stderr "ERROR: ODOO_SUDO_PASS is empty"
+  exit 2
+}
+set sudo_pass $env(ODOO_SUDO_PASS)
+
+set fh [open $local_script_path r]
+set remote_script [read $fh]
+close $fh
+
+proc fail {msg code} {
+  puts stderr $msg
+  exit $code
+}
+
+spawn ssh -tt -p $ssh_port $ssh_user@$ssh_host {sudo -S -p "" -iu odoo}
+after 500
+send -- "$sudo_pass\r"
+
+expect {
+  -re {odoo@.*[$#] ?$} {}
+  timeout { fail "ERROR: did not reach odoo shell prompt" 10 }
+  eof { fail "ERROR: ssh/sudo session closed before prompt" 11 }
+}
+
+send -- "cat > $remote_tmp <<'__REMOTE_SCRIPT__'\r"
+send -- $remote_script
+if {![string match "*\n" $remote_script]} {
+  send -- "\n"
+}
+send -- "__REMOTE_SCRIPT__\r"
+send -- "chmod 700 $remote_tmp\r"
+send -- "$remote_tmp; RC=\$?; rm -f $remote_tmp; echo __RC__\$RC\r"
+
+set rc ""
+expect {
+  -re {__RC__([0-9]+)} {
+    set rc $expect_out(1,string)
+  }
+  timeout { fail "ERROR: timed out waiting for remote script result" 12 }
+  eof { fail "ERROR: ssh/sudo session closed before remote script finished" 13 }
+}
+
+send -- "exit\r"
+expect eof
+
+if {$rc eq "0"} {
+  exit 0
+} else {
+  exit $rc
+}

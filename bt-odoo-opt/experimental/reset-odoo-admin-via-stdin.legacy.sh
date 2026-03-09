@@ -20,21 +20,12 @@ ADMIN_ID="2"
 usage() {
   cat <<'EOF'
 Usage:
-  # old style
   odoo-reset-admin probe
   odoo-reset-admin reset '<NEW_PASSWORD>'
 
-  # new style
-  odoo-reset-admin \
-    --target adminfpd@203.150.106.153 \
-    --ssh-option='-p 14321' \
-    --instance-name odoo19-prd \
-    --db v19_production_horizon_06032026 \
-    action reset-admin-pass '<NEW_PASSWORD>'
-
-Actions:
-  probe / action probe
-  reset / action reset-admin-pass '<NEW_PASSWORD>'
+Modes:
+  probe                探测远端 Odoo 运行参数，不改数据
+  reset <NEW_PASSWORD> 使用 Odoo shell 重置 admin 密码
 EOF
 }
 
@@ -43,104 +34,11 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
-MODE=""
-NEW_PASSWORD=""
-declare -a SSH_ARGS=()
+MODE="$1"
+shift || true
+NEW_PASSWORD="${1:-}"
 
-set_target() {
-  local value="$1"
-  if [[ "$value" == *"@"* ]]; then
-    SSH_USER="${value%@*}"
-    SSH_HOST="${value#*@}"
-  else
-    SSH_HOST="$value"
-  fi
-}
-
-add_ssh_option() {
-  local raw="$1"
-  local -a parts=()
-  read -r -a parts <<< "$raw"
-  local i=0
-  while [[ $i -lt ${#parts[@]} ]]; do
-    SSH_ARGS+=("${parts[$i]}")
-    if [[ "${parts[$i]}" == "-p" && $((i+1)) -lt ${#parts[@]} ]]; then
-      SSH_PORT="${parts[$((i+1))]}"
-      SSH_ARGS+=("${parts[$((i+1))]}")
-      i=$((i+2))
-      continue
-    fi
-    if [[ "${parts[$i]}" == -p* && "${parts[$i]}" != "-p" ]]; then
-      SSH_PORT="${parts[$i]#-p}"
-    fi
-    i=$((i+1))
-  done
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --target)
-      shift; set_target "${1:-}" ;;
-    --target=*)
-      set_target "${1#*=}" ;;
-    --ssh-option)
-      shift; add_ssh_option "${1:-}" ;;
-    --ssh-option=*)
-      add_ssh_option "${1#*=}" ;;
-    --instance-name)
-      shift; INSTANCE_HINT="${1:-}" ;;
-    --instance-name=*)
-      INSTANCE_HINT="${1#*=}" ;;
-    --db)
-      shift; DB_NAME="${1:-}" ;;
-    --db=*)
-      DB_NAME="${1#*=}" ;;
-    --python-bin)
-      shift; PINNED_PYTHON_BIN="${1:-}" ;;
-    --python-bin=*)
-      PINNED_PYTHON_BIN="${1#*=}" ;;
-    --odoo-bin)
-      shift; PINNED_ODOO_BIN="${1:-}" ;;
-    --odoo-bin=*)
-      PINNED_ODOO_BIN="${1#*=}" ;;
-    --config|--conf)
-      shift; PINNED_ODOO_CONF="${1:-}" ;;
-    --config=*|--conf=*)
-      PINNED_ODOO_CONF="${1#*=}" ;;
-    action)
-      shift
-      action_name="${1:-}"
-      case "$action_name" in
-        probe)
-          MODE="probe" ;;
-        reset-admin-pass|reset-admin-login-password|reset)
-          MODE="reset"
-          shift
-          NEW_PASSWORD="${1:-}" ;;
-        *)
-          echo "ERROR: unknown action '$action_name'" >&2
-          usage
-          exit 1 ;;
-      esac ;;
-    probe)
-      MODE="probe" ;;
-    reset)
-      MODE="reset"
-      shift
-      NEW_PASSWORD="${1:-}" ;;
-    -h|--help)
-      usage
-      exit 0 ;;
-    *)
-      echo "ERROR: unknown argument '$1'" >&2
-      usage
-      exit 1 ;;
-  esac
-  shift || true
-done
-
-if [[ -z "$MODE" ]]; then
-  echo "ERROR: missing action/mode" >&2
+if [[ "$MODE" != "probe" && "$MODE" != "reset" ]]; then
   usage
   exit 1
 fi
@@ -187,6 +85,7 @@ if [[ "$MODE" == "probe" ]]; then
 #!/bin/bash
 set -eu
 RAW_CMD="\$(ps -ef | grep '[o]doo' | grep -v 'odoo-bin shell' | grep -E '${INSTANCE_HINT}|${PINNED_ODOO_CONF}|${DB_NAME}' | head -n1 || true)"
+echo "RAW_CMD=\$RAW_CMD"
 
 PYTHON_BIN="\$(printf '%s\n' "\$RAW_CMD" | awk '{for(i=1;i<=NF;i++){if(\$i ~ /\/venv\/bin\/python([0-9.]*)?$/){print \$i; exit}}}')"
 [ -n "\${PYTHON_BIN:-}" ] || PYTHON_BIN="${PINNED_PYTHON_BIN}"
@@ -200,10 +99,14 @@ DB_PASSWORD="\$(printf '%s\n' "\$RAW_CMD" | awk '{for(i=1;i<=NF;i++){if(\$i=="--
 echo "PYTHON_BIN=\$PYTHON_BIN"
 echo "ODOO_BIN=\$ODOO_BIN"
 echo "ODOO_CONF=\$ODOO_CONF"
-[ -n "\${DB_HOST:-}" ] && echo "DB_HOST=\$DB_HOST"
-[ -n "\${DB_PORT:-}" ] && echo "DB_PORT=\$DB_PORT"
-[ -n "\${DB_USER:-}" ] && echo "DB_USER=\$DB_USER"
-[ -n "\${DB_PASSWORD:-}" ] && echo "DB_PASSWORD=<present>"
+echo "DB_HOST=\${DB_HOST:-}"
+echo "DB_PORT=\${DB_PORT:-}"
+echo "DB_USER=\${DB_USER:-}"
+if [ -n "\${DB_PASSWORD:-}" ]; then
+  echo "DB_PASSWORD=<present>"
+else
+  echo "DB_PASSWORD=<empty>"
+fi
 
 [ -n "\$ODOO_BIN" ] || { echo "ERROR: ODOO_BIN not found"; exit 21; }
 [ -n "\$ODOO_CONF" ] || { echo "ERROR: ODOO_CONF not found"; exit 22; }
@@ -220,6 +123,7 @@ PY
 #!/bin/bash
 set -eu
 RAW_CMD="\$(ps -ef | grep '[o]doo' | grep -v 'odoo-bin shell' | grep -E '${INSTANCE_HINT}|${PINNED_ODOO_CONF}|${DB_NAME}' | head -n1 || true)"
+echo "RAW_CMD=\$RAW_CMD"
 
 PYTHON_BIN="\$(printf '%s\n' "\$RAW_CMD" | awk '{for(i=1;i<=NF;i++){if(\$i ~ /\/venv\/bin\/python([0-9.]*)?$/){print \$i; exit}}}')"
 [ -n "\${PYTHON_BIN:-}" ] || PYTHON_BIN="${PINNED_PYTHON_BIN}"
@@ -241,6 +145,8 @@ CMD="PYTHONNOUSERSITE=1 \$PYTHON_BIN -s \$ODOO_BIN shell --no-http -c \$ODOO_CON
 [ -n "\${DB_USER:-}" ] && CMD="\$CMD --db_user \$DB_USER"
 [ -n "\${DB_PASSWORD:-}" ] && CMD="\$CMD --db_password \$DB_PASSWORD"
 
+echo "RUNNING: \$CMD"
+
 eval "\$CMD" <<'PYEOF'
 import base64
 new_password = base64.b64decode('${NEW_PASSWORD_B64}').decode('utf-8')
@@ -257,4 +163,4 @@ PYEOF
 EOF
 fi
 
-exec "$EXPECT_SCRIPT" "$SSH_USER" "$SSH_HOST" "$SSH_PORT" "$REMOTE_TMP" "$LOCAL_TMP" "${SSH_ARGS[@]}"
+exec "$EXPECT_SCRIPT" "$SSH_USER" "$SSH_HOST" "$SSH_PORT" "$REMOTE_TMP" "$LOCAL_TMP"

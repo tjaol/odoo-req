@@ -9,6 +9,7 @@ SSH automation toolkit for Odoo 19 server management.
 - **Remote log rotation** — detect Odoo log path and configure logrotate on the remote server
 - **Auth modes** — supports `password`, `key`, or `auto` authentication
 - **No-inject mode** — skip key lifecycle when server already trusts your key
+- **Odoo admin reset helper** — expect-driven remote helper for admin password reset (see `README-odoo-reset-admin.zh-en.md`)
 
 ## Usage
 
